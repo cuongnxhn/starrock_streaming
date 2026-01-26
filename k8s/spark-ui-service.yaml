@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-ui-service
+  namespace: default
+  labels:
+    app: spark
+spec:
+  type: NodePort  # Hoặc LoadBalancer nếu cluster hỗ trợ
+  ports:
+  - port: 4040
+    targetPort: 4040
+    nodePort: 30040  # Port trên node (30000-32767)
+    protocol: TCP
+    name: spark-ui
+  selector:
+    spark-role: driver  # Spark driver sẽ tự động có label này

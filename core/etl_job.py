@@ -2,6 +2,7 @@ from pyspark.sql.functions import from_json, col, schema_of_json
 from pyspark.sql.types import StructType, StructField, StringType
 import json
 from utils.common import calculate_max_offsets, calculate_trigger_interval
+from core.schema_processors import SchemaProcessorFactory
 
 class KafkaToIcebergETL:
     def __init__(self, spark, app_name, app_config, topic_configs, kafka_bootstrap_servers, checkpoint_base_dir):
@@ -12,111 +13,13 @@ class KafkaToIcebergETL:
         self.kafka_bootstrap_servers = kafka_bootstrap_servers
         self.checkpoint_base_dir = checkpoint_base_dir
 
-    def parse_and_validate_schema(self, schema_definition, topic_name):
-        """Parse và validate schema definition với error handling"""
-        if not schema_definition:
-            print(f"  ⚠ WARNING: schema_definition is null for topic '{topic_name}'")
-            return None
-            
-        try:
-            schema = StructType.fromJson(json.loads(schema_definition))
-            if len(schema.fields) == 0:
-                print(f"  ⚠ WARNING: schema_definition is empty for topic '{topic_name}'")
-                return None
-            return schema
-        except json.JSONDecodeError as e:
-            print(f"  ✗ ERROR: Invalid JSON in schema_definition for topic '{topic_name}': {e}")
-            return None
-        except Exception as e:
-            print(f"  ✗ ERROR: Failed to parse schema for topic '{topic_name}': {e}")
-            return None
-
-    def infer_schema_from_kafka(self, topic_name):
-        """Infer schema từ Kafka data (fallback khi schema_definition null)"""
-        print(f"  → Attempting to infer schema from Kafka topic '{topic_name}'...")
-        try:
-            # Đọc vài messages để infer schema
-            sample_df = self.spark.read \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", self.kafka_bootstrap_servers) \
-                .option("subscribe", topic_name) \
-                .option("startingOffsets", "earliest") \
-                .option("endingOffsets", "latest") \
-                .load() \
-                .selectExpr("CAST(value AS STRING) as json_value") \
-                .limit(100)
-            
-            if sample_df.isEmpty():
-                print(f"  ✗ ERROR: No messages found in topic '{topic_name}' for schema inference")
-                return None
-            
-            # Infer schema từ JSON
-            first_row = sample_df.first()
-            if first_row:
-                inferred = self.spark.read.json(
-                    self.spark.sparkContext.parallelize([first_row.json_value])
-                ).schema
-                
-                # Extract "after" schema từ envelope nếu có
-                if "after" in [f.name for f in inferred.fields]:
-                    after_field = [f for f in inferred.fields if f.name == "after"][0]
-                    data_schema = after_field.dataType
-                    print(f"  ✓ Inferred schema from Kafka data: {len(data_schema.fields)} fields")
-                    return data_schema
-                else:
-                    print(f"  ✓ Inferred schema from Kafka data: {len(inferred.fields)} fields")
-                    return inferred
-                    
-        except Exception as e:
-            print(f"  ✗ ERROR: Failed to infer schema from Kafka: {e}")
-            return None
-
-    def merge_schemas(self, old_schema, new_schema):
-        """Merge hai schemas để handle schema evolution (add new columns)"""
-        if not old_schema:
-            return new_schema
-        if not new_schema:
-            return old_schema
-            
-        old_fields = {f.name: f for f in old_schema.fields}
-        new_fields = {f.name: f for f in new_schema.fields}
-        
-        # Bắt đầu với old schema
-        merged_fields = list(old_schema.fields)
-        added_count = 0
-        
-        # Thêm các cột mới từ new_schema
-        for field_name, field in new_fields.items():
-            if field_name not in old_fields:
-                merged_fields.append(field)
-                added_count += 1
-                print(f"    + Adding new column: '{field_name}' ({field.dataType.simpleString()})")
-        
-        if added_count > 0:
-            print(f"  ✓ Schema merged: added {added_count} new column(s)")
-        
-        return StructType(merged_fields)
-
-    def get_or_infer_schema(self, topic_config):
-        """Lấy schema từ config hoặc infer từ data"""
-        topic_name = topic_config['topic_name']
-        schema_definition = topic_config.get('schema_definition')
-        
-        # Try parse từ config trước
-        data_schema = self.parse_and_validate_schema(schema_definition, topic_name)
-        
-        # Nếu không có hoặc invalid, infer từ Kafka
-        if data_schema is None:
-            data_schema = self.infer_schema_from_kafka(topic_name)
-            
-        # Nếu vẫn không có schema, raise error
-        if data_schema is None:
-            raise ValueError(
-                f"Cannot determine schema for topic '{topic_name}'. "
-                f"Please ensure schema_definition is valid or topic has data."
-            )
-        
-        return data_schema
+    def get_schema_processor(self, topic_name):
+        """Get schema processor cho topic"""
+        return SchemaProcessorFactory.get_processor(
+            topic_name, 
+            self.spark, 
+            self.kafka_bootstrap_servers
+        )
 
     def check_and_evolve_table_schema(self, database, table_name, new_schema):
         """Kiểm tra và evolve schema của bảng Iceberg nếu cần"""
@@ -202,19 +105,15 @@ class KafkaToIcebergETL:
         topic_name = topic_config['topic_name']
         table_name = topic_config['table_name']
         
-        # Get schema với validation và fallback
-        data_schema = self.get_or_infer_schema(topic_config)
+        # Get schema processor cho topic này
+        schema_processor = self.get_schema_processor(topic_name)
+        
+        # Get schema using processor
+        data_schema = schema_processor.get_data_schema(topic_config)
         partition_cols = topic_config['partition_columns'] # Used as MERGE keys
         
-        # Envelope Schema cho CDC
-        envelope_schema = StructType() \
-            .add("table", StringType()) \
-            .add("op_type", StringType()) \
-            .add("op_ts", StringType()) \
-            .add("current_ts", StringType()) \
-            .add("pos", StringType()) \
-            .add("before", data_schema) \
-            .add("after", data_schema)
+        # Get envelope schema using processor
+        envelope_schema = schema_processor.get_envelope_schema(topic_config, data_schema)
 
         # Set scheduler pool cho query này
         self.spark.sparkContext.setLocalProperty("spark.scheduler.pool", pool_name)
@@ -319,8 +218,10 @@ class KafkaToIcebergETL:
         # Tạo tables nếu chưa có và evolve schemas
         print("\nCreating/Evolving Iceberg tables...")
         for config in self.topic_configs:
-            # Get schema với validation
-            schema = self.get_or_infer_schema(config)
+            # Get schema processor
+            schema_processor = self.get_schema_processor(config['topic_name'])
+            # Get schema using processor
+            schema = schema_processor.get_data_schema(config)
             
             # Tạo table nếu chưa có
             self.create_iceberg_table_if_not_exists(

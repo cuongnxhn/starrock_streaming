@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Oracle JDBC Driver (Licensed file - download manually)
+# Do NOT commit this file to git
+jars/ojdbc*.jar
+
+# Kubernetes configs (may contain secrets)
+k8s/secrets/
+*.secret.yaml

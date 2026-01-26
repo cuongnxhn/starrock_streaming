@@ -1,4 +1,5 @@
 from pyspark.sql import SparkSession
+import os
 
 def create_spark_session(app_name, app_config):
     """Khởi tạo Spark session với config từ metadata"""
@@ -10,9 +11,9 @@ def create_spark_session(app_name, app_config):
                 "org.apache.iceberg.spark.SparkCatalog") \
         .config("spark.sql.catalog.starrocks_catalog.type", "rest") \
         .config("spark.sql.catalog.starrocks_catalog.uri",
-                "http://starrocks-fe:8181") \
+                os.getenv("STARROCK_FE", "http://10.165.13.116:8181")) \
         .config("spark.sql.catalog.starrocks_catalog.warehouse",
-                "s3://your-bucket/warehouse") \
+                os.getenv("ICEBERG_WAREHOUSE", "s3a://iceberg/warehouse")) \
         .config("spark.sql.catalog.starrocks_catalog.io-impl",
                 "org.apache.iceberg.aws.s3.S3FileIO") \
         .config("spark.jars.packages",
@@ -31,11 +32,11 @@ def create_spark_session(app_name, app_config):
         .config("spark.driver.cores", app_config.get('driver_cores')) \
         .config("spark.scheduler.mode", app_config.get('scheduler_mode'))
 
-    # Cấu hình cho multiple streaming queries
-    if app_config.get('scheduler_mode') == 'FAIR':
-        conf_builder = conf_builder \
-            .config("spark.scheduler.allocation.file",
-                    "/opt/spark/conf/fairscheduler.xml")
+
+#     if app_config.get('scheduler_mode') == 'FAIR':
+#         conf_builder = conf_builder \
+#             .config("spark.scheduler.allocation.file",
+#                     "/opt/spark/conf/fairscheduler.xml")
 
     spark = conf_builder.getOrCreate()
     
