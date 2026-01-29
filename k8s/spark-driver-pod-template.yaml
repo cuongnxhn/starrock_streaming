@@ -1,0 +1,57 @@
+---
+# Spark Driver Pod Template với Kafka secrets mounted
+# Sử dụng với spark-submit --conf spark.kubernetes.driver.podTemplateFile=...
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spark-driver
+spec:
+  containers:
+  - name: spark-driver
+    env:
+    # Point to the mounted client.properties file
+    - name: KAFKA_CLIENT_PROPERTIES
+      value: /etc/kafka/secrets/client.properties
+    
+    # S3 credentials for checkpoint and data storage
+    - name: S3_ENDPOINT
+      value: "http://10.165.13.127:9000"
+    - name: S3_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: s3-credentials
+          key: access-key
+    - name: S3_SECRET_KEY
+      valueFrom:
+        secretKeyRef:
+          name: s3-credentials
+          key: secret-key
+    - name: STARROCK_FE
+      value: "http://10.165.13.116:8181"
+    - name: ICEBERG_WAREHOUSE
+      value: "s3a://iceberg/warehouse"
+    
+    volumeMounts:
+    # Mount client.properties từ secret
+    - name: kafka-client-config
+      mountPath: /etc/kafka/secrets
+      readOnly: true
+    
+    # Mount SSL certificates nếu cần
+    - name: kafka-ssl-certs
+      mountPath: /etc/kafka/ssl
+      readOnly: true
+  
+  volumes:
+  # Secret chứa client.properties
+  - name: kafka-client-config
+    secret:
+      secretName: kafka-client-config
+      defaultMode: 0444  # Read-only for all users (fixes PermissionError)
+  
+  # Secret chứa SSL certificates
+  - name: kafka-ssl-certs
+    secret:
+      secretName: kafka-ssl-certs
+      defaultMode: 0444  # Read-only for all users (fixes PermissionError)

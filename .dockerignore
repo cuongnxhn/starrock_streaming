@@ -19,5 +19,4 @@ venv/
 ENV/
 *.log
 .DS_Store
-k8s/
 deploy*.sh

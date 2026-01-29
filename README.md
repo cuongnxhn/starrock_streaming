@@ -42,7 +42,7 @@ spark-submit main.py \
     --topic-name orders
 ```
 
-### 3. Deploy nhiều topics tự động
+### 3. Deploy nhiều topics tự động (Local/YARN)
 ```powershell
 # Windows
 .\deploy_per_topic.ps1 -AppName "my_app" -Topics "orders,payments,users"
@@ -50,6 +50,25 @@ spark-submit main.py \
 # Linux/Mac
 ./deploy_per_topic.sh my_app orders,payments,users
 ```
+
+### 4. Deploy to Kubernetes ⭐ NEW!
+```bash
+# Setup Kafka authentication secrets (one-time)
+./setup_kafka_secrets.sh
+
+# Deploy with kubectl  (Recommended for K8s)
+./deploy_k8s_per_topic_kubectl.sh cdc_streaming topic1,topic2
+
+# OR deploy with spark-submit
+./deploy_k8s_per_topic.sh cdc_streaming topic1,topic2
+```
+
+**📖 K8s Deployment Guides:**
+- **[WHICH_DEPLOY_SCRIPT.md](WHICH_DEPLOY_SCRIPT.md)** - ⭐ START HERE: Chọn script deploy phù hợp
+- **[K8S_CHEATSHEET.md](K8S_CHEATSHEET.md)** - Quick reference cho tất cả K8s commands
+- **[DEPLOY_GUIDE.md](DEPLOY_GUIDE.md)** - Hướng dẫn deploy chi tiết
+- **[k8s/KAFKA_AUTH_GUIDE.md](k8s/KAFKA_AUTH_GUIDE.md)** - Kafka authentication trên K8s
+- **[docs/S3_CHECKPOINT_GUIDE.md](docs/S3_CHECKPOINT_GUIDE.md)** - 🔧 S3 Checkpoint configuration (QUAN TRỌNG!)
 
 Hướng dẫn chi tiết: [`QUICKSTART.md`](QUICKSTART.md)
 

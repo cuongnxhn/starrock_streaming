@@ -30,3 +30,7 @@ jars/ojdbc*.jar
 # Kubernetes configs (may contain secrets)
 k8s/secrets/
 *.secret.yaml
+
+# JAR files
+jars/
+

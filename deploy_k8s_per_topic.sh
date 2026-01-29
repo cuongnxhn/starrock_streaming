@@ -18,10 +18,10 @@ fi
 # Kubernetes config
 K8S_NAMESPACE="default"
 K8S_SERVICE_ACCOUNT="spark"
-DOCKER_IMAGE="<YOUR_DOCKER_REGISTRY>/starrock-streaming:latest"  # Thay bằng image của bạn
+DOCKER_IMAGE="10.165.13.117:5000/starrock-streaming:latest"  # Thay bằng image của bạn
 
 # Spark config
-SPARK_MASTER="k8s://https://kubernetes.default.svc:443"  # Hoặc URL của K8s API server
+SPARK_MASTER="k8s://https://10.165.13.48:6443"  # Hoặc URL của K8s API server
 EXECUTOR_MEMORY="4g"
 EXECUTOR_CORES="2"
 DRIVER_MEMORY="2g"
@@ -59,6 +59,8 @@ for TOPIC in "${TOPIC_ARRAY[@]}"; do
         --conf spark.kubernetes.executor.label.app=$APP_NAME \
         --conf spark.kubernetes.executor.label.topic=$TOPIC \
         --conf spark.kubernetes.driver.pod.name="${JOB_NAME}-driver" \
+        --conf spark.kubernetes.driver.podTemplateFile=k8s/spark-driver-pod-template.yaml \
+        --conf spark.kubernetes.executor.podTemplateFile=k8s/spark-executor-pod-template.yaml \
         --conf spark.executor.instances=$EXECUTOR_INSTANCES \
         --conf spark.executor.memory=$EXECUTOR_MEMORY \
         --conf spark.executor.cores=$EXECUTOR_CORES \
@@ -69,7 +71,7 @@ for TOPIC in "${TOPIC_ARRAY[@]}"; do
         --conf spark.eventLog.enabled=true \
         --conf spark.eventLog.dir=$EVENT_LOG_DIR \
         --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
-        main.py \
+        local:///app/main.py \
         --app-name "$APP_NAME" \
         --topic-name "$TOPIC" \
         --kafka-bootstrap-servers "$KAFKA_SERVERS" \

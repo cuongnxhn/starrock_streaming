@@ -3,6 +3,8 @@ from pyspark.sql.types import StructType, StructField, StringType
 import json
 from utils.common import calculate_max_offsets, calculate_trigger_interval
 from core.schema_processors import SchemaProcessorFactory
+from utils.kafka_config import KafkaConfig
+import os
 
 class KafkaToIcebergETL:
     def __init__(self, spark, app_name, app_config, topic_configs, kafka_bootstrap_servers, checkpoint_base_dir):
@@ -75,7 +77,7 @@ class KafkaToIcebergETL:
         # Tạo DDL
         fields = []
         for field in schema.fields:
-            nullable = "NULL" if field.nullable else "NOT NULL"
+            nullable = "" if field.nullable else "NOT NULL"
             fields.append(f"{field.name} {field.dataType.simpleString()} {nullable}")
 
         fields_sql = ",\n    ".join(fields)
@@ -84,7 +86,7 @@ class KafkaToIcebergETL:
         partition_clause = ""
         if partition_cols:
             # Partition by days của timestamp column
-            partition_clause = f"PARTITIONED BY (days({partition_cols}))"
+            partition_clause = f"PARTITIONED BY ({partition_cols})" 
 
         create_sql = f"""
         CREATE TABLE IF NOT EXISTS {full_table_name} (
@@ -118,16 +120,23 @@ class KafkaToIcebergETL:
         # Set scheduler pool cho query này
         self.spark.sparkContext.setLocalProperty("spark.scheduler.pool", pool_name)
 
+        # Load Kafka authentication config
+        kafka_auth = KafkaConfig.load_auth_config()
+
         # Đọc từ Kafka
-        kafka_stream = self.spark.readStream \
+        stream_reader = self.spark.readStream \
             .format("kafka") \
             .option("kafka.bootstrap.servers", self.kafka_bootstrap_servers) \
             .option("subscribe", topic_name) \
-            .option("startingOffsets", "latest") \
+            .option("startingOffsets", "earliest") \
             .option("failOnDataLoss", "false") \
             .option("maxOffsetsPerTrigger", calculate_max_offsets(
-                topic_config['expected_msg_per_day'])) \
-            .load()
+                topic_config['expected_msg_per_day']))
+        
+        # Apply authentication options
+        stream_reader = KafkaConfig.apply_auth_options(stream_reader, kafka_auth)
+        
+        kafka_stream = stream_reader.load()
 
         # Parse JSON với envelope schema
         parsed_stream = kafka_stream.select(
@@ -143,7 +152,7 @@ class KafkaToIcebergETL:
             batch_df.cache()
             
             try:
-                full_table_name = f"starrocks_catalog.lakehouse.{table_name}"
+                full_table_name = f"iceberg.warehouse.{table_name}"
                 
                 # 1. Handle Inserts (op_type = 'I')
                 inserts = batch_df.filter(col("op_type") == "I").select("after.*")
@@ -222,10 +231,10 @@ class KafkaToIcebergETL:
             schema_processor = self.get_schema_processor(config['topic_name'])
             # Get schema using processor
             schema = schema_processor.get_data_schema(config)
-            
+            namespace = os.getenv("ICEBERG_NAMESPACE", "warehouse")
             # Tạo table nếu chưa có
             self.create_iceberg_table_if_not_exists(
-                "lakehouse",
+                namespace,
                 config['table_name'],
                 schema,
                 config['partition_columns']
@@ -233,7 +242,7 @@ class KafkaToIcebergETL:
             
             # Evolve schema nếu cần
             self.check_and_evolve_table_schema(
-                "lakehouse",
+                namespace,
                 config['table_name'],
                 schema
             )

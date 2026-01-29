@@ -1,0 +1,56 @@
+# Kafka Client Authentication Configuration
+# File này chứa các config để authenticate vào Kafka cluster
+# Rename file này thành client.properties và điền các giá trị thực tế
+
+# === BASIC CONFIG ===
+# Bootstrap servers (có thể bỏ qua vì đã có trong env)
+# bootstrap.servers=10.165.11.236:9093,10.165.11.237:9093,10.165.11.238:9093
+
+# === SECURITY PROTOCOL ===
+# Chọn một trong các security protocol sau:
+# - PLAINTEXT: Không authentication (default)
+# - SASL_PLAINTEXT: SASL authentication không encryption
+# - SASL_SSL: SASL authentication với SSL encryption
+# - SSL: SSL authentication và encryption
+
+security.protocol=SASL_SSL
+
+# === SASL CONFIGURATION ===
+# Nếu dùng SASL, chọn mechanism:
+# - PLAIN: Username/password
+# - SCRAM-SHA-256: SCRAM authentication
+# - SCRAM-SHA-512: SCRAM authentication
+# - GSSAPI: Kerberos
+
+sasl.mechanism=PLAIN
+
+# JAAS config cho SASL/PLAIN (thay username và password thực tế)
+# Format: org.apache.kafka.common.security.plain.PlainLoginModule required username="<username>" password="<password>";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret";
+
+# === SSL CONFIGURATION ===
+# Nếu dùng SSL, cần config các file certificate
+
+# Truststore (chứa CA certificate để verify Kafka broker)
+ssl.truststore.location=/path/to/kafka.client.truststore.jks
+ssl.truststore.password=truststore-password
+
+# Keystore (chứa client certificate nếu cần mutual TLS)
+# ssl.keystore.location=/path/to/kafka.client.keystore.jks
+# ssl.keystore.password=keystore-password
+# ssl.key.password=key-password
+
+# SSL protocol
+ssl.protocol=TLSv1.2
+
+# === KERBEROS CONFIGURATION ===
+# Nếu dùng Kerberos (SASL_GSSAPI)
+# sasl.kerberos.service.name=kafka
+# sasl.jaas.config=com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true keyTab="/path/to/keytab" principal="kafka-client@REALM";
+
+# === ADDITIONAL SETTINGS ===
+# Request timeout
+request.timeout.ms=30000
+
+# Session timeout
+session.timeout.ms=30000

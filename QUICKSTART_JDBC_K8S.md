@@ -33,13 +33,37 @@ mkdir jars
 
 ### Bước 3: Deploy lên K8s
 
+**Có 2 cách deploy:**
+
+#### Cách 1: Từ máy có Spark client (khuyến nghị cho dev/testing)
+
 ```bash
+# Chạy từ máy LOCAL có spark-submit (không phải trên K8s node!)
+# Yêu cầu: Spark client installed, kubectl configured
+
 # Sửa DOCKER_IMAGE trong deploy_k8s_per_topic.sh
 # DOCKER_IMAGE="gcr.io/your-project/starrock-streaming:v1.0"
 
 # Deploy
-./deploy_k8s_per_topic.sh my_app orders,payments
+./deploy_k8s_per_topic.sh my_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO
 ```
+
+#### Cách 2: Chạy trực tiếp trên K8s node (không cần Spark client)
+
+```bash
+# Có thể chạy TRỰC TIẾP trên K8s control plane hoặc worker node
+# Chỉ cần kubectl
+
+# Sửa DOCKER_IMAGE trong deploy_k8s_per_topic_kubectl.sh
+# DOCKER_IMAGE="10.165.13.117:5000/starrock-streaming:latest"
+
+# Deploy
+./deploy_k8s_per_topic_kubectl.sh low_traffic_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO
+```
+
+> ⚠️ **Lỗi "spark-submit: command not found"?**
+> Bạn đang dùng script sai! Script `deploy_k8s_per_topic.sh` cần Spark client.
+> Dùng `deploy_k8s_per_topic_kubectl.sh` thay thế khi chạy trên K8s node.
 
 ## 📦 Cách hoạt động
 

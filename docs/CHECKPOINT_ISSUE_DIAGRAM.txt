@@ -1,0 +1,261 @@
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   CHECKPOINT ISSUE: ROOT CAUSE                      │
+└─────────────────────────────────────────────────────────────────────┘
+
+════════════════════════════════════════════════════════════════════════
+TRƯỚC KHI FIX (❌ VẤN ĐỀ)
+════════════════════════════════════════════════════════════════════════
+
+┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+│              │          │              │          │              │
+│  Spark Job   │          │   K8s Pod    │          │     S3       │
+│              │          │              │          │   MinIO      │
+└──────┬───────┘          └──────┬───────┘          └──────┬───────┘
+       │                         │                         │
+       │  Write checkpoint       │                         │
+       │  to s3a://iceberg/      │                         │
+       ├────────────────────────>│                         │
+       │                         │   Try write to S3       │
+       │                         ├────────────────────────>│
+       │                         │                         │
+       │                         │   ❌ ACCESS DENIED!     │
+       │                         │   (No S3 credentials)   │
+       │                         │<────────────────────────┤
+       │                         │                         │
+       │                         │  💡 FALLBACK to local   │
+       │                         │     /tmp/checkpoints/   │
+       │  ✓ Checkpoint saved     │                         │
+       │<────────────────────────┤                         │
+       │  (at /tmp - LOCAL!)     │                         │
+       │                         │                         │
+
+RESULT:
+  🔸 Checkpoint lưu ở LOCAL filesystem (/tmp trong pod)
+  🔸 S3 bucket RỖNG - không có checkpoints/
+  🔸 Khi pod restart → checkpoint MẤT
+  🔸 Job resume từ checkpoint → ĐỌC TỪ LATEST OFFSET
+  🔸 Bỏ qua 10,137 messages cũ ❌
+
+
+════════════════════════════════════════════════════════════════════════
+SAU KHI FIX (✅ GIẢI PHÁP)
+════════════════════════════════════════════════════════════════════════
+
+┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+│              │          │              │          │              │
+│  Spark Job   │          │   K8s Pod    │          │     S3       │
+│              │          │  + S3 Secret │          │   MinIO      │
+└──────┬───────┘          └──────┬───────┘          └──────┬───────┘
+       │                         │                         │
+       │  Write checkpoint       │  🔑 Has credentials:    │
+       │  to s3a://iceberg/      │  - S3_ACCESS_KEY        │
+       ├────────────────────────>│  - S3_SECRET_KEY        │
+       │                         │                         │
+       │                         │   Write to S3           │
+       │                         ├────────────────────────>│
+       │                         │                         │
+       │                         │   ✅ SUCCESS!           │
+       │                         │<────────────────────────┤
+       │                         │                         │
+       │  ✓ Checkpoint saved     │                         │
+       │<────────────────────────┤                         │
+       │  (in S3 - PERSISTENT!)  │                         │
+       │                         │                         │
+
+RESULT:
+  🔸 Checkpoint lưu ở S3 (persistent, durable)
+  🔸 S3 bucket có checkpoints/<app>/<topic>/
+  🔸 Khi pod restart → checkpoint VẪN TỒN TẠI
+  🔸 Job resume từ checkpoint CHÍNH XÁC
+  🔸 Exactly-once processing ✅
+
+
+════════════════════════════════════════════════════════════════════════
+TIMELINE CỦA VẤN ĐỀ
+════════════════════════════════════════════════════════════════════════
+
+TIME   │ EVENT                                      │ OFFSET
+───────┼────────────────────────────────────────────┼─────────
+T0     │ Kafka topic có 10,137 messages             │ 0-10137
+       │                                            │
+T1     │ Job start lần 1 (schema inference)         │
+       │ - startingOffsets = "earliest"             │
+       │ - Consume vài messages để infer schema     │ 0-5
+       │ - Create table                             │
+       │ - Save checkpoint to /tmp (LOCAL!)         │
+       │   ❌ Failed to save to S3                  │
+       │ - Checkpoint offset = 10137 (latest)       │
+       │                                            │
+T2     │ Job đang chạy (streaming mode)             │
+       │ - Load checkpoint từ /tmp                  │
+       │ - Resume from offset 10137                 │ 10137
+       │ - ⚠️ Bỏ qua 10,137 messages cũ             │
+       │ - Chờ message MỚI...                       │
+       │                                            │
+T3     │ ❌ KHÔNG CÓ DATA                           │ 10137
+       │ (vì topic không có message mới)            │
+
+
+════════════════════════════════════════════════════════════════════════
+SPARK OFFSET RESOLUTION LOGIC
+════════════════════════════════════════════════════════════════════════
+
+                    ┌─────────────────────┐
+                    │  Job Starts         │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │ Checkpoint exists?  │
+                    └──────────┬──────────┘
+                               │
+                ┌──────────────┼──────────────┐
+                │ YES                    NO   │
+                ▼                             ▼
+    ┌─────────────────────┐      ┌─────────────────────┐
+    │ USE CHECKPOINT      │      │ USE startingOffsets │
+    │ (IGNORE config!)    │      │ config              │
+    └──────────┬──────────┘      └──────────┬──────────┘
+               │                            │
+               ▼                            ▼
+    ┌─────────────────────┐      ┌─────────────────────┐
+    │ Resume from saved   │      │ Start from          │
+    │ offset in           │      │ "earliest" or       │
+    │ checkpoint          │      │ "latest"            │
+    └─────────────────────┘      └─────────────────────┘
+
+KEY TAKEAWAY:
+  🔑 Checkpoint ALWAYS takes priority over startingOffsets!
+  🔑 Để đọc lại từ đầu → Phải XÓA checkpoint
+
+
+════════════════════════════════════════════════════════════════════════
+POD TEMPLATE COMPARISON
+════════════════════════════════════════════════════════════════════════
+
+BEFORE (Missing S3 credentials):
+┌─────────────────────────────────────┐
+│ Pod: spark-executor                 │
+├─────────────────────────────────────┤
+│ env:                                │
+│   - KAFKA_CLIENT_PROPERTIES ✅      │
+│                                     │
+│ volumes:                            │
+│   - kafka-client-config (Secret) ✅ │
+│   - kafka-ssl-certs (Secret) ✅     │
+│                                     │
+│ ❌ NO S3 credentials!               │
+│    → Cannot write to S3             │
+│    → Fallback to /tmp               │
+└─────────────────────────────────────┘
+
+AFTER (With S3 credentials):
+┌─────────────────────────────────────┐
+│ Pod: spark-executor                 │
+├─────────────────────────────────────┤
+│ env:                                │
+│   - KAFKA_CLIENT_PROPERTIES ✅      │
+│   - S3_ENDPOINT ✅                  │
+│   - S3_ACCESS_KEY ✅ (from Secret)  │
+│   - S3_SECRET_KEY ✅ (from Secret)  │
+│   - STARROCK_FE ✅                  │
+│   - ICEBERG_WAREHOUSE ✅            │
+│                                     │
+│ volumes:                            │
+│   - kafka-client-config (Secret) ✅ │
+│   - kafka-ssl-certs (Secret) ✅     │
+│                                     │
+│ ✅ HAS S3 credentials!              │
+│    → Can write to S3 ✓              │
+└─────────────────────────────────────┘
+
+
+════════════════════════════════════════════════════════════════════════
+S3 SECRET STRUCTURE
+════════════════════════════════════════════════════════════════════════
+
+kubectl create secret generic s3-credentials \
+    --from-literal=access-key="minioadmin" \
+    --from-literal=secret-key="minioadmin"
+
+┌─────────────────────────────────────────┐
+│ Secret: s3-credentials                  │
+├─────────────────────────────────────────┤
+│ Data:                                   │
+│   access-key: bWluaW9hZG1pbg== (base64) │
+│   secret-key: bWluaW9hZG1pbg== (base64) │
+└─────────────────────────────────────────┘
+           │
+           │ Referenced in pod template:
+           ▼
+┌─────────────────────────────────────────┐
+│ env:                                    │
+│   - name: S3_ACCESS_KEY                 │
+│     valueFrom:                          │
+│       secretKeyRef:                     │
+│         name: s3-credentials            │
+│         key: access-key                 │
+└─────────────────────────────────────────┘
+           │
+           │ Read by Spark:
+           ▼
+┌─────────────────────────────────────────┐
+│ utils/spark.py:                         │
+│   s3_access_key = os.getenv(            │
+│       "S3_ACCESS_KEY", "minioadmin")    │
+│                                         │
+│   .config("spark.hadoop.fs.s3a.        │
+│            access.key", s3_access_key)  │
+└─────────────────────────────────────────┘
+
+
+════════════════════════════════════════════════════════════════════════
+EXPECTED S3 STRUCTURE AFTER FIX
+════════════════════════════════════════════════════════════════════════
+
+s3a://iceberg/
+├── warehouse/
+│   └── <table_name>/
+│       ├── metadata/
+│       └── data/
+│
+└── checkpoints/                    # 🎯 ĐÍCH CỦA FIX
+    └── <app_name>/
+        └── <topic_name>/
+            ├── commits/
+            │   ├── 0
+            │   ├── 1
+            │   └── ...
+            ├── offsets/
+            │   ├── 0
+            │   ├── 1
+            │   └── ...
+            └── metadata
+
+
+════════════════════════════════════════════════════════════════════════
+VERIFICATION FLOW
+════════════════════════════════════════════════════════════════════════
+
+Step 1: Create Secret
+   └─> kubectl get secret s3-credentials ✓
+
+Step 2: Deploy Job with new pod templates
+   └─> kubectl get pods ✓
+
+Step 3: Check pod has env vars
+   └─> kubectl exec pod -- env | grep S3 ✓
+
+Step 4: Wait for checkpoint creation
+   └─> mc ls minio/iceberg/checkpoints/ ✓
+
+Step 5: Verify data consumption
+   └─> kubectl logs pod | grep "read X records" ✓
+
+Step 6: Query table
+   └─> SELECT COUNT(*) FROM table ✓
+
+
+════════════════════════════════════════════════════════════════════════
+```

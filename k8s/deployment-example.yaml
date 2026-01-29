@@ -1,0 +1,68 @@
+---
+# Ví dụ Deployment cho Spark application với Kafka authentication
+# Nếu bạn đang chạy application như một long-running service
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: starrocks-streaming
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: starrocks-streaming
+  template:
+    metadata:
+      labels:
+        app: starrocks-streaming
+    spec:
+      containers:
+      - name: spark-app
+        image: your-docker-registry/starrocks-streaming:latest
+        
+        # Environment variables
+        env:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "10.165.11.236:9093,10.165.11.237:9093,10.165.11.238:9093"
+        
+        # Point to mounted client.properties
+        - name: KAFKA_CLIENT_PROPERTIES
+          value: /etc/kafka/secrets/client.properties
+        
+        - name: SPARK_MASTER
+          value: "k8s://https://kubernetes.default.svc:443"
+        
+        # Volume mounts
+        volumeMounts:
+        # Mount Kafka client.properties
+        - name: kafka-client-config
+          mountPath: /etc/kafka/secrets
+          readOnly: true
+        
+        # Mount SSL certificates
+        - name: kafka-ssl-certs
+          mountPath: /etc/kafka/ssl
+          readOnly: true
+        
+        # Mount checkpoints (nếu cần persistent storage)
+        - name: spark-checkpoints
+          mountPath: /opt/spark/checkpoints
+      
+      volumes:
+      # Kafka authentication config
+      - name: kafka-client-config
+        secret:
+          secretName: kafka-client-config
+          defaultMode: 0444  # Read-only for all users
+      
+      # SSL certificates
+      - name: kafka-ssl-certs
+        secret:
+          secretName: kafka-ssl-certs
+          defaultMode: 0444  # Read-only for all users
+      
+      # Persistent volume cho checkpoints
+      - name: spark-checkpoints
+        persistentVolumeClaim:
+          claimName: spark-checkpoints-pvc

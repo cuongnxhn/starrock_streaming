@@ -1,6 +1,7 @@
 import json
 from pyspark.sql.types import StructType, StringType
 from .base import BaseSchemaProcessor
+from utils.kafka_config import KafkaConfig
 
 
 class DefaultSchemaProcessor(BaseSchemaProcessor):
@@ -31,20 +32,38 @@ class DefaultSchemaProcessor(BaseSchemaProcessor):
     def infer_schema_from_kafka(self, topic_name):
         """Infer schema từ Kafka data (fallback khi schema_definition null)"""
         print(f"  → Attempting to infer schema from Kafka topic '{topic_name}'...")
+        print(f"     Kafka bootstrap servers: {self.kafka_bootstrap_servers}")
+        
+        # Load Kafka authentication config
+        kafka_auth = KafkaConfig.load_auth_config()
+        
         try:
             # Đọc vài messages để infer schema
-            sample_df = self.spark.read \
+            reader = self.spark.read \
                 .format("kafka") \
                 .option("kafka.bootstrap.servers", self.kafka_bootstrap_servers) \
                 .option("subscribe", topic_name) \
                 .option("startingOffsets", "earliest") \
-                .option("endingOffsets", "latest") \
-                .load() \
+                .option("endingOffsets", "latest")
+            
+            # Apply authentication options
+            reader = KafkaConfig.apply_auth_options(reader, kafka_auth)
+            
+            sample_df = reader.load() \
                 .selectExpr("CAST(value AS STRING) as json_value") \
                 .limit(100)
             
+            # Count để debug
+            sample_count = sample_df.count()
+            print(f"     Đọc được {sample_count} messages từ Kafka")
+            
             if sample_df.isEmpty():
                 print(f"  ✗ ERROR: No messages found in topic '{topic_name}' for schema inference")
+                print(f"     Debug steps:")
+                print(f"       1. Verify topic '{topic_name}' exists in Kafka")
+                print(f"       2. Verify topic has data: kafka-console-consumer --bootstrap-server {self.kafka_bootstrap_servers} --topic {topic_name} --from-beginning --max-messages 1")
+                print(f"       3. Check network connectivity to Kafka brokers")
+                print(f"       4. Run debug_kafka.py script for detailed diagnostics")
                 return None
             
             # Infer schema từ JSON
@@ -54,11 +73,28 @@ class DefaultSchemaProcessor(BaseSchemaProcessor):
                     self.spark.sparkContext.parallelize([first_row.json_value])
                 ).schema
                 
-                # Extract "after" schema từ envelope nếu có
-                if "after" in [f.name for f in inferred.fields]:
+
+                op_type = None
+                if "op_type" in [f.name for f in inferred.fields]:
+                    # Parse JSON để lấy op_type value
+                    json_data = json.loads(first_row.json_value)
+                    op_type = json_data.get("op_type")
+                    print(f"  → Detected op_type: {op_type}")
+                
+                # Extract schema dựa trên op_type
+                if op_type == "U":  # Update - lấy schema từ "before"
+                    if "before" in [f.name for f in inferred.fields]:
+                        before_field = [f for f in inferred.fields if f.name == "before"][0]
+                        data_schema = before_field.dataType
+                        print(f"  ✓ Inferred schema from 'before' (UPDATE): {len(data_schema.fields)} fields")
+                        return data_schema
+                    else:
+                        print(f"  ⚠ WARNING: op_type is 'U' but 'before' field not found")
+                        return None
+                elif "after" in [f.name for f in inferred.fields]:  # Insert hoặc các op khác - lấy từ "after"
                     after_field = [f for f in inferred.fields if f.name == "after"][0]
                     data_schema = after_field.dataType
-                    print(f"  ✓ Inferred schema from Kafka data: {len(data_schema.fields)} fields")
+                    print(f"  ✓ Inferred schema from 'after' (INSERT/other): {len(data_schema.fields)} fields")
                     return data_schema
                 else:
                     print(f"  ✓ Inferred schema from Kafka data: {len(inferred.fields)} fields")
@@ -74,7 +110,7 @@ class DefaultSchemaProcessor(BaseSchemaProcessor):
         Try parse từ config trước, nếu không có thì infer từ Kafka.
         """
         topic_name = topic_config['topic_name']
-        schema_definition = topic_config.get('schema_definition')
+        schema_definition = topic_config['schema_definition']
         
         # Try parse từ config trước
         data_schema = self.parse_and_validate_schema(schema_definition, topic_name)
