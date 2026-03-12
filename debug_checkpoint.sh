@@ -17,11 +17,11 @@ echo "========================================"
 
 # 1. Check S3 secret
 echo -e "\n1️⃣ Checking S3 credentials secret..."
-if kubectl get secret s3-credentials -n default &>/dev/null; then
+if kubectl get secret app-env-secret -n default &>/dev/null; then
     echo "   ✅ Secret exists"
-    kubectl describe secret s3-credentials -n default | grep "Data"
+    kubectl describe secret app-env-secret -n default | grep "Data"
 else
-    echo "   ❌ Secret NOT found! Run: ./setup_s3_secrets.sh"
+    echo "   ❌ Secret NOT found! Run: ./setup_k8s_secret.sh"
 fi
 
 # 2. Check pod templates
@@ -142,12 +142,12 @@ echo "📊 Summary & Recommendations"
 echo "========================================"
 
 # Check if all prerequisites are met
-SECRET_OK=$(kubectl get secret s3-credentials -n default &>/dev/null && echo "true" || echo "false")
+SECRET_OK=$(kubectl get secret app-env-secret -n default &>/dev/null && echo "true" || echo "false")
 TEMPLATE_OK=$(grep -q "S3_ACCESS_KEY" k8s/spark-driver-pod-template.yaml && echo "true" || echo "false")
 
 if [ "$SECRET_OK" = "false" ]; then
-    echo "❌ Action Required: Create S3 credentials secret"
-    echo "   Run: ./setup_s3_secrets.sh"
+    echo "❌ Action Required: Create app-env-secret secret"
+    echo "   Run: ./setup_k8s_secret.sh"
 fi
 
 if [ "$TEMPLATE_OK" = "false" ]; then

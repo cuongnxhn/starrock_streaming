@@ -20,13 +20,13 @@ spec:
     - name: S3_ACCESS_KEY
       valueFrom:
         secretKeyRef:
-          name: s3-credentials
-          key: access-key
+          name: app-env-secret
+          key: S3_ACCESS_KEY
     - name: S3_SECRET_KEY
       valueFrom:
         secretKeyRef:
-          name: s3-credentials
-          key: secret-key
+          name: app-env-secret
+          key: S3_SECRET_KEY
     - name: STARROCK_FE
       value: "http://10.165.13.116:8181"
     - name: ICEBERG_WAREHOUSE

@@ -354,6 +354,10 @@ You're now using the **production-ready approach** for Spark on Kubernetes with 
 **Build and push your Docker image, then deploy!** 🚀
 
 ```bash
+# example : 
+# ./deploy_k8s_per_topic_kubectl.sh low_traffic_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO
+# Remove image
+docker rmi 10.165.13.117:5000/starrock-streaming:latest
 # Build
 docker build -t 10.165.13.117:5000/starrock-streaming:latest .
 
@@ -362,6 +366,11 @@ docker push 10.165.13.117:5000/starrock-streaming:latest
 
 # Deploy
 ./deploy_k8s_per_topic.sh my_app my_topic
-```
+example : ./deploy_k8s_per_topic_kubectl.sh low_traffic_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO
+
+# Remove
+ kubectl delete deployment -l app=low-traffic-app -n default
+ kubectl delete deployment low-traffic-app-cdc-log-onebss-css-hd-bancheo -n default
+ kubectl delete starrocks-streaming -n default
 
 Good luck! 🎉
