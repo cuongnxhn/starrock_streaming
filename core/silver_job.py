@@ -163,6 +163,10 @@ class BronzeToSilverETL:
             schema_processor = self.get_schema_processor(topic_name)
             data_schema = schema_processor.get_data_schema(topic_config)
 
+            if data_schema is None:
+                print(f"    ⚠ WARNING: Skipping topic '{topic_name}' due to missing schema")
+                return
+
             # Parse after_data JSON string thành struct fields
             from pyspark.sql.functions import from_json
             after_parsed = (
@@ -267,6 +271,11 @@ class BronzeToSilverETL:
         for config in self.topic_configs:
             schema_processor = self.get_schema_processor(config['topic_name'])
             schema = schema_processor.get_data_schema(config)
+            
+            if schema is None:
+                print(f"  ⚠ WARNING: Skipping topic '{config['topic_name']}' due to missing schema")
+                continue
+                
             namespace = os.getenv("ICEBERG_NAMESPACE", "warehouse")
             self.create_silver_table_if_not_exists(
                 namespace,

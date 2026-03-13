@@ -119,12 +119,13 @@ class DefaultSchemaProcessor(BaseSchemaProcessor):
         if data_schema is None:
             data_schema = self.infer_schema_from_kafka(topic_name)
             
-        # Nếu vẫn không có schema, raise error
+        # Nếu vẫn không có schema, log warning và trả về None
         if data_schema is None:
-            raise ValueError(
-                f"Cannot determine schema for topic '{topic_name}'. "
-                f"Please ensure schema_definition is valid or topic has data."
+            print(
+                f"  ⚠ WARNING: Cannot determine schema for topic '{topic_name}'. "
+                f"Skipping as there is no data or valid schema_definition."
             )
+            return None
         
         return data_schema
     

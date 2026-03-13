@@ -108,6 +108,11 @@ class KafkaToBronzeETL:
         # Schema processor
         schema_processor = self.get_schema_processor(topic_name)
         data_schema = schema_processor.get_data_schema(topic_config)
+        
+        if data_schema is None:
+            print(f"  ⚠ WARNING: Skipping stream for topic '{topic_name}' due to missing schema.")
+            return None
+
         envelope_schema = schema_processor.get_envelope_schema(topic_config, data_schema)
 
         # Đảm bảo Bronze table tồn tại
@@ -254,7 +259,8 @@ class KafkaToBronzeETL:
         for idx, config in enumerate(self.topic_configs):
             pool_name = f"pool_{idx % max_concurrent}"
             query = self.process_topic_stream(config, pool_name)
-            active_queries.append(query)
+            if query is not None:
+                active_queries.append(query)
 
         print(f"\n✓ [Bronze] All {len(active_queries)} streams started successfully")
         print(f"Waiting for termination...\n")
