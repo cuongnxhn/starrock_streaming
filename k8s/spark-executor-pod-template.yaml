@@ -6,7 +6,12 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: spark-executor
+  annotations:
+    # Executor pods sẽ được Spark xóa qua deleteOnTermination=true
+    # activeDeadlineSeconds đảm bảo không có zombie pod nếu driver crash
 spec:
+  restartPolicy: Never        # Executor KHÔNG tự restart - Spark tự tạo executor mới
+  activeDeadlineSeconds: 3600 # Safety net: tự terminate sau 1h nếu bị treo
   containers:
   - name: spark-executor
     env:

@@ -364,6 +364,9 @@ docker build -t 10.165.13.117:5000/starrock-streaming:latest .
 # Push
 docker push 10.165.13.117:5000/starrock-streaming:latest
 
+kubectl apply -f spark-rbac.yaml
+
+sed -i -e 's/\r$//' deploy_bronze_k8s.sh
 # Deploy
 ./deploy_k8s_per_topic.sh my_app my_topic
 example : ./deploy_k8s_per_topic_kubectl.sh low_traffic_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO

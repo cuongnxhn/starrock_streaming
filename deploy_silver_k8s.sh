@@ -36,9 +36,9 @@ EXECUTOR_CORES="2"
 DRIVER_MEMORY="2G"
 EXECUTOR_INSTANCES="2"
 
-# Silver job chạy mỗi 5 phút, lookback 15 phút để đảm bảo không bỏ sót
-CRON_SCHEDULE="*/5 * * * *"
-LOOKBACK_MINUTES="15"
+# Silver job chạy mỗi 10 phút
+CRON_SCHEDULE="*/10 * * * *"
+
 
 # Tên CronJob: silver-<app_name> (gạch dưới → gạch ngang, chữ thường)
 CRONJOB_NAME="silver-${APP_NAME}"
@@ -54,8 +54,7 @@ if [ -n "$SINGLE_TOPIC" ]; then
 else
     echo "Topics:   ALL (loaded from topic_configurations)"
 fi
-echo "Schedule: $CRON_SCHEDULE (every 5 min)"
-echo "Lookback: ${LOOKBACK_MINUTES} min"
+echo "Schedule: $CRON_SCHEDULE (every 10 min)"
 echo "Mode:     rawdata (Bronze) → warehouse (Silver)"
 echo "==========================================="
 echo ""
@@ -86,8 +85,8 @@ spec:
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
-      # Timeout sau 4 phút (< 5 phút cron interval) để tránh chồng chất
-      activeDeadlineSeconds: 240
+      # Timeout sau 4 phút (< 10 phút cron interval) để tránh chồng chất
+      activeDeadlineSeconds: 400
       template:
         metadata:
           labels:
@@ -131,6 +130,8 @@ spec:
             - --conf
             - spark.driver.blockManager.port=7079
             - --conf
+            - spark.kubernetes.driver.pod.name=\$(POD_NAME)
+            - --conf
             - spark.kubernetes.executor.podNamePrefix=${CRONJOB_NAME}
             - --conf
             - spark.kubernetes.executor.deleteOnTermination=true
@@ -145,8 +146,6 @@ spec:
             - /app/silver_main.py
             - --app-name
             - ${APP_NAME}${TOPIC_ARG}
-            - --lookback-minutes
-            - "${LOOKBACK_MINUTES}"
             resources:
               requests:
                 memory: 2Gi
@@ -170,14 +169,23 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: KAFKA_CLIENT_PROPERTIES
+              value: /etc/kafka/secrets/client.properties
             envFrom:
             - secretRef:
                 name: app-env-secret
             volumeMounts:
+            - name: kafka-client-config
+              mountPath: /etc/kafka/secrets
+              readOnly: true
             - name: kafka-ssl-certs
               mountPath: /etc/kafka/ssl
               readOnly: true
           volumes:
+          - name: kafka-client-config
+            secret:
+              secretName: kafka-client-config
+              defaultMode: 0444
           - name: kafka-ssl-certs
             secret:
               secretName: kafka-ssl-certs

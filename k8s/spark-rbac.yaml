@@ -11,7 +11,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["pods", "services", "configmaps"]
-  verbs: ["create", "get", "watch", "list", "delete", "update", "patch"]
+  verbs: ["create", "get", "watch", "list", "delete", "deletecollection", "update", "patch"]
 - apiGroups: [""]
   resources: ["persistentvolumeclaims"]
   verbs: ["create", "delete", "deletecollection", "get", "list", "watch"]

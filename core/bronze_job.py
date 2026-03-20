@@ -228,8 +228,8 @@ class KafkaToBronzeETL:
             .trigger(processingTime=calculate_trigger_interval(
                 topic_config['expected_msg_per_day'])) \
             .option("checkpointLocation",
-                    f"{self.checkpoint_base_dir}/bronze/{self.app_name}/{topic_name}") \
-            .queryName(f"bronze_{self.app_name}_{topic_name}") \
+                    f"{self.checkpoint_base_dir}/bronze/{topic_name}") \
+            .queryName(f"bronze_{topic_name}") \
             .start()
 
         print(f"  ✓ [Bronze] Started stream: {topic_name} → rawdata.{table_name} (pool: {pool_name})")

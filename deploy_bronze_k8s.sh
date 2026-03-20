@@ -131,6 +131,18 @@ spec:
         - spark.kubernetes.executor.podTemplateFile=/app/k8s/spark-executor-pod-template.yaml
         - --conf
         - spark.kubernetes.memoryOverheadFactor=0.1
+        - --conf
+        - spark.network.timeout=800s
+        - --conf
+        - spark.executor.heartbeatInterval=60s
+        - --conf
+        - spark.kubernetes.executor.checkAllContainers=true
+        - --conf
+        - spark.dynamicAllocation.enabled=false
+        - --conf
+        - spark.task.maxFailures=3
+        - --conf
+        - spark.stage.maxConsecutiveAttempts=4
         - /app/bronze_main.py
         - --app-name
         - ${APP_NAME}${TOPIC_ARG}
