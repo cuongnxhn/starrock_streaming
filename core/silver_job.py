@@ -238,6 +238,13 @@ class BronzeToSilverETL:
             if batch_df.isEmpty():
                 return
 
+            # QUAN TRỌNG: Spark Streaming tạo một SparkSession con (cloned session) cho
+            # mỗi micro-batch. batch_df thuộc session này. createOrReplaceTempView() đăng ký
+            # view vào session đó. Nếu dùng self.spark (main session) để chạy SQL, view sẽ
+            # không tìm thấy vì là 2 session khác nhau → TABLE_OR_VIEW_NOT_FOUND.
+            # Giải pháp: luôn dùng batch_df.sparkSession cho mọi SQL trong foreachBatch.
+            spark = batch_df.sparkSession
+
             # Persist the microbatch because we will apply multiple filters and actions
             batch_df.persist()
             total_count = batch_df.count()
@@ -257,6 +264,9 @@ class BronzeToSilverETL:
                 )
                 .select("operation", "after_struct.*")
             )
+            # Cache sớm để tất cả các filter/action sau dùng chung materialized data,
+            # tránh lazy re-evaluation trong foreachBatch context gây lỗi temp view
+            after_parsed.cache()
 
             before_parsed = (
                 batch_df
@@ -267,6 +277,7 @@ class BronzeToSilverETL:
                 )
                 .select("operation", "before_struct.*")
             )
+            before_parsed.cache()
 
             # ====== 1. Inserts ======
             # Dùng MERGE INTO (upsert) thay vì .append() để đảm bảo idempotent:
@@ -274,23 +285,27 @@ class BronzeToSilverETL:
             # sẽ bị UPDATE thay vì tạo bản ghi trùng lặp.
             # Fallback về .append() chỉ khi không có partition_cols (không có primary key).
             inserts_df = after_parsed.filter(col("operation") == "insert").drop("operation")
-            if not inserts_df.isEmpty():
+            inserts_df.cache()
+            inserts_df_count = inserts_df.count()  # materialize ngay lập tức
+            if inserts_df_count > 0:
                 inserts_casted = self.cast_to_table_schema(inserts_df, table_name, namespace)
                 if not partition_cols:
                     # Không có primary key → không thể deduplicate, cứ append
                     # ⚠ WARNING: có thể bị trùng nếu mất checkpoint
                     print(f"      ⚠ WARNING: No primary keys for {table_name} — INSERT uses append (not idempotent)")
                     inserts_casted.writeTo(silver_table).append()
-                    print(f"      - Appended {inserts_casted.count()} rows → {table_name}")
+                    print(f"      - Appended {inserts_df_count} rows → {table_name}")
                 else:
                     # Có primary key → MERGE INTO để đảm bảo idempotent
                     keys = [k.strip() for k in partition_cols.split(",")]
-                    inserts_casted.cache()
-                    inserts_count = inserts_casted.count()
                     inserts_view = f"silver_inserts_tmp_{batch_id}"
+                    inserts_casted.cache()
+                    inserts_count = inserts_casted.count()  # trigger materialize trước khi tạo view
                     inserts_casted.createOrReplaceTempView(inserts_view)
                     try:
-                        on_clause = " AND ".join([f"t.{k} = s.{k}" for k in keys])
+                        on_clause = " AND ".join(
+                            [f"(t.{k} = s.{k} OR (t.{k} IS NULL AND s.{k} IS NULL))" for k in keys]
+                        )
                         all_cols = [f.name for f in inserts_casted.schema.fields]
                         set_clauses = [f"t.{c} = s.{c}" for c in all_cols]
                         insert_cols_sql = ", ".join(all_cols)
@@ -306,28 +321,32 @@ class BronzeToSilverETL:
                             INSERT ({insert_cols_sql})
                             VALUES ({values_sql})
                         """
-                        self.spark.sql(merge_sql)
+                        spark.sql(merge_sql)  # dùng batch session, không phải self.spark
                         print(f"      - Upserted (INSERT/idempotent) {inserts_count} rows → {table_name}")
                     finally:
-                        self.spark.catalog.dropTempView(inserts_view)
+                        spark.catalog.dropTempView(inserts_view)
                         inserts_casted.unpersist()
+
+            inserts_df.unpersist()
 
             # ====== 2. Updates (MERGE UPSERT) ======
             updates_df = after_parsed.filter(col("operation") == "update").drop("operation")
-            if not updates_df.isEmpty():
+            updates_df.cache()
+            updates_df_count = updates_df.count()  # materialize ngay lập tức
+            if updates_df_count > 0:
                 if not partition_cols:
                     print(f"      ⚠ WARNING: No keys for upsert on {table_name}, skipping updates")
                 else:
                     keys = [k.strip() for k in partition_cols.split(",")]
                     updates_casted = self.cast_to_table_schema(updates_df, table_name, namespace)
-                    # Cache trước để materialize DataFrame, tránh lazy evaluation
-                    # gây lỗi TABLE_OR_VIEW_NOT_FOUND trong foreachBatch context
                     updates_casted.cache()
-                    updates_count = updates_casted.count()  # trigger action để cache thực sự
+                    updates_count = updates_casted.count()  # trigger materialize trước khi tạo view
                     updates_view = f"silver_updates_tmp_{batch_id}"
                     updates_casted.createOrReplaceTempView(updates_view)
                     try:
-                        on_clause = " AND ".join([f"t.{k} = s.{k}" for k in keys])
+                        on_clause = " AND ".join(
+                            [f"(t.{k} = s.{k} OR (t.{k} IS NULL AND s.{k} IS NULL))" for k in keys]
+                        )
                         set_clauses = [
                             f"t.{f.name} = COALESCE(s.{f.name}, t.{f.name})"
                             for f in updates_casted.schema.fields
@@ -344,28 +363,32 @@ class BronzeToSilverETL:
                             INSERT ({", ".join(insert_cols)})
                             VALUES ({", ".join(["s." + c for c in insert_cols])})
                         """
-                        self.spark.sql(merge_sql)
+                        spark.sql(merge_sql)  # dùng batch session, không phải self.spark
                         print(f"      - Merged {updates_count} rows → {table_name}")
                     finally:
-                        self.spark.catalog.dropTempView(updates_view)
+                        spark.catalog.dropTempView(updates_view)
                         updates_casted.unpersist()
+
+            updates_df.unpersist()
 
             # ====== 3. Deletes ======
             deletes_df = before_parsed.filter(col("operation") == "delete").drop("operation")
-            if not deletes_df.isEmpty():
+            deletes_df.cache()
+            deletes_df_count = deletes_df.count()  # materialize ngay lập tức
+            if deletes_df_count > 0:
                 if not partition_cols:
                     print(f"      ⚠ WARNING: No keys for delete on {table_name}, skipping deletes")
                 else:
                     keys = [k.strip() for k in partition_cols.split(",")]
                     deletes_casted = self.cast_to_table_schema(deletes_df, table_name, namespace)
-                    # Cache trước để materialize DataFrame, tránh lazy evaluation
-                    # gây lỗi TABLE_OR_VIEW_NOT_FOUND trong foreachBatch context
                     deletes_casted.cache()
-                    deletes_count = deletes_casted.count()  # trigger action để cache thực sự
+                    deletes_count = deletes_casted.count()  # trigger materialize trước khi tạo view
                     deletes_view = f"silver_deletes_tmp_{batch_id}"
                     deletes_casted.createOrReplaceTempView(deletes_view)
                     try:
-                        on_clause = " AND ".join([f"t.{k} = s.{k}" for k in keys])
+                        on_clause = " AND ".join(
+                            [f"(t.{k} = s.{k} OR (t.{k} IS NULL AND s.{k} IS NULL))" for k in keys]
+                        )
 
                         delete_sql = f"""
                         MERGE INTO {silver_table} t
@@ -373,19 +396,28 @@ class BronzeToSilverETL:
                         ON {on_clause}
                         WHEN MATCHED THEN DELETE
                         """
-                        self.spark.sql(delete_sql)
+                        spark.sql(delete_sql)  # dùng batch session, không phải self.spark
                         print(f"      - Deleted {deletes_count} rows from {table_name}")
                     finally:
-                        self.spark.catalog.dropTempView(deletes_view)
+                        spark.catalog.dropTempView(deletes_view)
                         deletes_casted.unpersist()
 
+            deletes_df.unpersist()
+            after_parsed.unpersist()
+            before_parsed.unpersist()
             batch_df.unpersist()
 
         try:
             # Khởi động Structured Streaming với AvailableNow
+            # streaming-skip-delete-snapshots=true : bỏ qua các Iceberg delete snapshots
+            #   (sinh ra khi Bronze table có MERGE/DELETE row-level), tránh lỗi:
+            #   IllegalStateException: Cannot process delete snapshot
+            # streaming-skip-overwrite-snapshots=true : bỏ qua overwrite snapshots tương tự
             stream_query = (
                 self.spark.readStream
                 .format("iceberg")
+                .option("streaming-skip-delete-snapshots", "true")
+                .option("streaming-skip-overwrite-snapshots", "true")
                 .load(bronze_table)
                 .writeStream
                 .foreachBatch(process_micro_batch)
