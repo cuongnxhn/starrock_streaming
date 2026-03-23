@@ -12,8 +12,10 @@ Kiến trúc: Bronze/Silver (Medallion)
 """
 
 from pyspark.sql.functions import (
-    col, lit, when, coalesce, to_json, struct, expr, current_timestamp, from_json
+    col, lit, when, coalesce, to_json, struct, expr, current_timestamp, from_json,
+    row_number, desc
 )
+from pyspark.sql import Window
 from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType, VarcharType
 )
@@ -173,8 +175,48 @@ class BronzeToSilverETL:
 
             return df.select(*casted_cols)
         except Exception as e:
-            print(f"  ⚠ WARNING: Failed to cast DataFrame to table schema: {e}")
+            import traceback
+            print(f"  ⚠ WARNING: Failed to cast DataFrame to table schema for {full_table_name}: {e}")
+            print(traceback.format_exc())
             return df
+
+    def _get_silver_key_ddl_types(self, silver_table: str, keys: list) -> dict:
+        """
+        Trả về dict {col_name: ddl_type_string} cho các cột key trong Silver table.
+        Dùng để build CAST explicit trong ON clause, tránh type mismatch
+        giữa dữ liệu từ JSON (string) và Silver table schema (decimal, int, ...).
+        Trả về {} nếu không đọc được schema.
+        """
+        try:
+            target_fields = {f.name: f.dataType for f in self.spark.table(silver_table).schema.fields}
+            return {
+                k: _spark_type_to_silver_ddl(target_fields[k])
+                for k in keys
+                if k in target_fields
+            }
+        except Exception as e:
+            print(f"  ⚠ WARNING: Cannot read Silver schema for ON clause CAST ({silver_table}): {e}")
+            return {}
+
+    def _build_null_safe_on_clause(self, keys: list, key_ddl_types: dict) -> str:
+        """
+        Sinh ON clause với:
+        - CAST(s.k AS <ddl_type>) để ép kiểu source về đúng kiểu của Silver table,
+          tránh duplicate do type mismatch (vd: string '2230248' vs decimal).
+        - NULL-safe equality: (t.k = s_cast OR (t.k IS NULL AND s_cast IS NULL))
+          tránh duplicate khi cột key có giá trị NULL.
+        """
+        conditions = []
+        for k in keys:
+            ddl_type = key_ddl_types.get(k)
+            if ddl_type:
+                s_expr = f"CAST(s.{k} AS {ddl_type})"
+            else:
+                s_expr = f"s.{k}"
+            conditions.append(
+                f"(t.{k} = {s_expr} OR (t.{k} IS NULL AND {s_expr} IS NULL))"
+            )
+        return " AND ".join(conditions)
 
     def create_silver_table_if_not_exists(self, database, table_name, data_schema, partition_cols):
         catalog = os.getenv("ICEBERG_CATALOG", "iceberg")
@@ -219,6 +261,7 @@ class BronzeToSilverETL:
         topic_name = topic_config['topic_name']
         table_name = topic_config['table_name']
         partition_cols = topic_config['partition_columns']
+        primary_keys = topic_config['primary_keys']
 
         catalog = os.getenv("ICEBERG_CATALOG", "iceberg")
         namespace = os.getenv("ICEBERG_SILVER_NAMESPACE", "staging")
@@ -245,7 +288,14 @@ class BronzeToSilverETL:
             # Giải pháp: luôn dùng batch_df.sparkSession cho mọi SQL trong foreachBatch.
             spark = batch_df.sparkSession
 
+            # Tắt broadcast join tại session level — đảm bảo cloned batch session
+            # không tự động dùng broadcast (có thể không kế thừa từ spark-submit conf).
+            # Broadcast join trên bảng lớn gây treo executor không có log.
+            spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+            spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
+
             # Persist the microbatch because we will apply multiple filters and actions
+            # (insert / update / delete filters đều đọc lại batch_df)
             batch_df.persist()
             total_count = batch_df.count()
 
@@ -255,62 +305,74 @@ class BronzeToSilverETL:
 
             print(f"    → [MicroBatch {batch_id}] Found {total_count} messages to process")
 
+            # Chỉ parse-on-the-fly từ batch_df đã persist — KHÔNG cache thêm
+            # vì mỗi parsed DF chỉ dùng 1 lần cho 1 operation type.
+            # Việc cache quá nhiều DF lồng nhau gây GC overhead nặng trên bảng lớn.
             after_parsed = (
                 batch_df
                 .filter(col("after_data").isNotNull())
                 .select(
                     col("operation"),
+                    col("op_ts"),  # giữ lại để dedup theo thứ tự CDC
                     from_json(col("after_data"), data_schema).alias("after_struct")
                 )
-                .select("operation", "after_struct.*")
+                .select("operation", "op_ts", "after_struct.*")
             )
-            # Cache sớm để tất cả các filter/action sau dùng chung materialized data,
-            # tránh lazy re-evaluation trong foreachBatch context gây lỗi temp view
-            after_parsed.cache()
 
             before_parsed = (
                 batch_df
                 .filter(col("before_data").isNotNull())
                 .select(
                     col("operation"),
+                    col("op_ts"),  # giữ lại để dedup theo thứ tự CDC
                     from_json(col("before_data"), data_schema).alias("before_struct")
                 )
-                .select("operation", "before_struct.*")
+                .select("operation", "op_ts", "before_struct.*")
             )
-            before_parsed.cache()
 
             # ====== 1. Inserts ======
             # Dùng MERGE INTO (upsert) thay vì .append() để đảm bảo idempotent:
             # nếu checkpoint bị mất và job chạy lại từ đầu, các dòng insert đã tồn tại
             # sẽ bị UPDATE thay vì tạo bản ghi trùng lặp.
-            # Fallback về .append() chỉ khi không có partition_cols (không có primary key).
+            # Fallback về .append() chỉ khi không có primary key
             inserts_df = after_parsed.filter(col("operation") == "insert").drop("operation")
-            inserts_df.cache()
-            inserts_df_count = inserts_df.count()  # materialize ngay lập tức
+            inserts_df_count = inserts_df.count()
+            print(f"      [Batch {batch_id}] inserts count: {inserts_df_count}")
             if inserts_df_count > 0:
-                inserts_casted = self.cast_to_table_schema(inserts_df, table_name, namespace)
-                if not partition_cols:
+                if not primary_keys:
                     # Không có primary key → không thể deduplicate, cứ append
                     # ⚠ WARNING: có thể bị trùng nếu mất checkpoint
                     print(f"      ⚠ WARNING: No primary keys for {table_name} — INSERT uses append (not idempotent)")
+                    inserts_no_ts = inserts_df.drop("op_ts")
+                    inserts_casted = self.cast_to_table_schema(inserts_no_ts, table_name, namespace)
                     inserts_casted.writeTo(silver_table).append()
                     print(f"      - Appended {inserts_df_count} rows → {table_name}")
                 else:
-                    # Có primary key → MERGE INTO để đảm bảo idempotent
-                    keys = [k.strip() for k in partition_cols.split(",")]
+                    # Dedup theo PK TRƯỚC KHI cast — op_ts phải còn tồn tại lúc orderBy
+                    keys = [k.strip() for k in primary_keys.split(",")]
+                    window = Window.partitionBy(*keys).orderBy(desc("op_ts"))
+                    inserts_deduped_raw = (
+                        inserts_df
+                        .withColumn("_rn", row_number().over(window))
+                        .filter(col("_rn") == 1)
+                        .drop("_rn", "op_ts")  # bỏ op_ts trước khi cast vào Silver
+                    )
+                    # Cast về Silver schema SAU KHI đã dedup và drop op_ts
+                    inserts_deduped = self.cast_to_table_schema(inserts_deduped_raw, table_name, namespace)
+                    # Checkpoint (persist) trước khi tạo view để MERGE đọc data đã materialized
+                    inserts_deduped = inserts_deduped.localCheckpoint()
+                    inserts_count = inserts_deduped.count()
                     inserts_view = f"silver_inserts_tmp_{batch_id}"
-                    inserts_casted.cache()
-                    inserts_count = inserts_casted.count()  # trigger materialize trước khi tạo view
-                    inserts_casted.createOrReplaceTempView(inserts_view)
+                    inserts_deduped.createOrReplaceTempView(inserts_view)
                     try:
-                        on_clause = " AND ".join(
-                            [f"(t.{k} = s.{k} OR (t.{k} IS NULL AND s.{k} IS NULL))" for k in keys]
-                        )
-                        all_cols = [f.name for f in inserts_casted.schema.fields]
+                        key_ddl_types = self._get_silver_key_ddl_types(silver_table, keys)
+                        on_clause = self._build_null_safe_on_clause(keys, key_ddl_types)
+                        all_cols = [f.name for f in inserts_deduped.schema.fields]
                         set_clauses = [f"t.{c} = s.{c}" for c in all_cols]
                         insert_cols_sql = ", ".join(all_cols)
                         values_sql = ", ".join([f"s.{c}" for c in all_cols])
 
+                        print(f"      [Batch {batch_id}] Running INSERT MERGE ({inserts_count} rows) → {table_name}")
                         merge_sql = f"""
                         MERGE INTO {silver_table} t
                         USING {inserts_view} s
@@ -325,34 +387,40 @@ class BronzeToSilverETL:
                         print(f"      - Upserted (INSERT/idempotent) {inserts_count} rows → {table_name}")
                     finally:
                         spark.catalog.dropTempView(inserts_view)
-                        inserts_casted.unpersist()
-
-            inserts_df.unpersist()
 
             # ====== 2. Updates (MERGE UPSERT) ======
             updates_df = after_parsed.filter(col("operation") == "update").drop("operation")
-            updates_df.cache()
-            updates_df_count = updates_df.count()  # materialize ngay lập tức
+            updates_df_count = updates_df.count()
+            print(f"      [Batch {batch_id}] updates count: {updates_df_count}")
             if updates_df_count > 0:
-                if not partition_cols:
+                if not primary_keys:
                     print(f"      ⚠ WARNING: No keys for upsert on {table_name}, skipping updates")
                 else:
-                    keys = [k.strip() for k in partition_cols.split(",")]
-                    updates_casted = self.cast_to_table_schema(updates_df, table_name, namespace)
-                    updates_casted.cache()
-                    updates_count = updates_casted.count()  # trigger materialize trước khi tạo view
+                    # Dedup theo PK TRƯỚC KHI cast — op_ts phải còn tồn tại lúc orderBy
+                    keys = [k.strip() for k in primary_keys.split(",")]
+                    window = Window.partitionBy(*keys).orderBy(desc("op_ts"))
+                    updates_deduped_raw = (
+                        updates_df
+                        .withColumn("_rn", row_number().over(window))
+                        .filter(col("_rn") == 1)
+                        .drop("_rn", "op_ts")  # bỏ op_ts trước khi cast vào Silver
+                    )
+                    # Cast về Silver schema SAU KHI đã dedup và drop op_ts
+                    updates_deduped = self.cast_to_table_schema(updates_deduped_raw, table_name, namespace)
+                    updates_deduped = updates_deduped.localCheckpoint()
+                    updates_count = updates_deduped.count()
                     updates_view = f"silver_updates_tmp_{batch_id}"
-                    updates_casted.createOrReplaceTempView(updates_view)
+                    updates_deduped.createOrReplaceTempView(updates_view)
                     try:
-                        on_clause = " AND ".join(
-                            [f"(t.{k} = s.{k} OR (t.{k} IS NULL AND s.{k} IS NULL))" for k in keys]
-                        )
+                        key_ddl_types = self._get_silver_key_ddl_types(silver_table, keys)
+                        on_clause = self._build_null_safe_on_clause(keys, key_ddl_types)
                         set_clauses = [
                             f"t.{f.name} = COALESCE(s.{f.name}, t.{f.name})"
-                            for f in updates_casted.schema.fields
+                            for f in updates_deduped.schema.fields
                         ]
-                        insert_cols = [f.name for f in updates_casted.schema.fields]
+                        insert_cols = [f.name for f in updates_deduped.schema.fields]
 
+                        print(f"      [Batch {batch_id}] Running UPDATE MERGE ({updates_count} rows) → {table_name}")
                         merge_sql = f"""
                         MERGE INTO {silver_table} t
                         USING {updates_view} s
@@ -367,29 +435,35 @@ class BronzeToSilverETL:
                         print(f"      - Merged {updates_count} rows → {table_name}")
                     finally:
                         spark.catalog.dropTempView(updates_view)
-                        updates_casted.unpersist()
-
-            updates_df.unpersist()
 
             # ====== 3. Deletes ======
             deletes_df = before_parsed.filter(col("operation") == "delete").drop("operation")
-            deletes_df.cache()
-            deletes_df_count = deletes_df.count()  # materialize ngay lập tức
+            deletes_df_count = deletes_df.count()
+            print(f"      [Batch {batch_id}] deletes count: {deletes_df_count}")
             if deletes_df_count > 0:
-                if not partition_cols:
+                if not primary_keys:
                     print(f"      ⚠ WARNING: No keys for delete on {table_name}, skipping deletes")
                 else:
-                    keys = [k.strip() for k in partition_cols.split(",")]
-                    deletes_casted = self.cast_to_table_schema(deletes_df, table_name, namespace)
-                    deletes_casted.cache()
-                    deletes_count = deletes_casted.count()  # trigger materialize trước khi tạo view
+                    # Dedup theo PK TRƯỚC KHI cast — op_ts phải còn tồn tại lúc orderBy
+                    keys = [k.strip() for k in primary_keys.split(",")]
+                    window = Window.partitionBy(*keys).orderBy(desc("op_ts"))
+                    deletes_deduped_raw = (
+                        deletes_df
+                        .withColumn("_rn", row_number().over(window))
+                        .filter(col("_rn") == 1)
+                        .drop("_rn", "op_ts")  # chỉ cần PK để match, drop op_ts
+                    )
+                    # Cast về Silver schema SAU KHI đã dedup và drop op_ts
+                    deletes_deduped = self.cast_to_table_schema(deletes_deduped_raw, table_name, namespace)
+                    deletes_deduped = deletes_deduped.localCheckpoint()
+                    deletes_count = deletes_deduped.count()
                     deletes_view = f"silver_deletes_tmp_{batch_id}"
-                    deletes_casted.createOrReplaceTempView(deletes_view)
+                    deletes_deduped.createOrReplaceTempView(deletes_view)
                     try:
-                        on_clause = " AND ".join(
-                            [f"(t.{k} = s.{k} OR (t.{k} IS NULL AND s.{k} IS NULL))" for k in keys]
-                        )
+                        key_ddl_types = self._get_silver_key_ddl_types(silver_table, keys)
+                        on_clause = self._build_null_safe_on_clause(keys, key_ddl_types)
 
+                        print(f"      [Batch {batch_id}] Running DELETE MERGE ({deletes_count} rows) → {table_name}")
                         delete_sql = f"""
                         MERGE INTO {silver_table} t
                         USING {deletes_view} s
@@ -400,11 +474,7 @@ class BronzeToSilverETL:
                         print(f"      - Deleted {deletes_count} rows from {table_name}")
                     finally:
                         spark.catalog.dropTempView(deletes_view)
-                        deletes_casted.unpersist()
 
-            deletes_df.unpersist()
-            after_parsed.unpersist()
-            before_parsed.unpersist()
             batch_df.unpersist()
 
         try:
@@ -479,7 +549,9 @@ class BronzeToSilverETL:
                 self.process_topic_stream(config, topic_schemas[topic_name])
                 success_count += 1
             except Exception as e:
+                import traceback
                 print(f"  ✗ Failed to process topic {topic_name}: {e}")
+                print(traceback.format_exc())
                 error_count += 1
 
         print(f"\n========================================")

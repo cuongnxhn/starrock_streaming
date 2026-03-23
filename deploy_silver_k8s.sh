@@ -31,7 +31,7 @@ K8S_NAMESPACE="default"
 K8S_SERVICE_ACCOUNT="spark"
 DOCKER_IMAGE="10.165.13.117:5000/starrock-streaming:latest"
 
-EXECUTOR_MEMORY="4G"
+EXECUTOR_MEMORY="6G"
 EXECUTOR_CORES="2"
 DRIVER_MEMORY="2G"
 EXECUTOR_INSTANCES="2"
@@ -85,8 +85,7 @@ spec:
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
-      # Timeout sau 4 phút (< 10 phút cron interval) để tránh chồng chất
-      activeDeadlineSeconds: 400
+      activeDeadlineSeconds: 3600
       template:
         metadata:
           labels:
@@ -142,7 +141,35 @@ spec:
             - --conf
             - spark.kubernetes.executor.podTemplateFile=/app/k8s/spark-executor-pod-template.yaml
             - --conf
-            - spark.kubernetes.memoryOverheadFactor=0.1
+            - spark.kubernetes.memoryOverheadFactor=0.2
+            # Tắt hoàn toàn Broadcast Join — dùng SortMergeJoin thay thế
+            - --conf
+            - spark.sql.autoBroadcastJoinThreshold=-1
+            # Tắt Adaptive Broadcast Join trong AQE (vẫn có thể trigger broadcast)
+            - --conf
+            - spark.sql.adaptive.enabled=true
+            - --conf
+            - spark.sql.adaptive.localShuffleReader.enabled=true
+            - --conf
+            - spark.sql.adaptive.autoBroadcastJoinThreshold=-1
+            # Giảm broadcastTimeout → fail-fast thay vì treo 10 phút
+            - --conf
+            - spark.sql.broadcastTimeout=120
+            # Network timeout đủ lớn cho MERGE bảng lớn
+            - --conf
+            - spark.network.timeout=600s
+            - --conf
+            - spark.executor.heartbeatInterval=60s
+            # TẮT speculation — gây task storm trên bảng lớn, làm executor bị OOM
+            - --conf
+            - spark.speculation=false
+            - --conf
+            - spark.task.maxFailures=4
+            # Iceberg MERGE: đọc file theo sequence thay vì parallel quá mức
+            - --conf
+            - spark.sql.iceberg.merge-on-read.enabled=false
+            - --conf
+            - spark.sql.shuffle.partitions=200
             - /app/silver_main.py
             - --app-name
             - ${APP_NAME}${TOPIC_ARG}
