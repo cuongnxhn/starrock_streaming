@@ -49,8 +49,8 @@ class KafkaToBronzeETL:
 
     def create_bronze_table_if_not_exists(self, table_name):
         """Tạo Bronze table trong rawdata namespace nếu chưa tồn tại"""
-        log_catalog = os.getenv("ICEBERG_LOG_CATALOG", "iceberg")
-        log_namespace = os.getenv("ICEBERG_LOG_NAMESPACE", "rawdata")
+        log_catalog = os.getenv("ICEBERG_CATALOG_BRONZE", "iceberg")
+        log_namespace = os.getenv("ICEBERG_NAMESPACE_BRONZE", "rawdata")
         full_table_name = f"{log_catalog}.{log_namespace}.{table_name}"
 
         bronze_schema = StructType([
@@ -137,10 +137,13 @@ class KafkaToBronzeETL:
         stream_reader = KafkaConfig.apply_auth_options(stream_reader, kafka_auth)
         kafka_stream = stream_reader.load()
 
-        # Parse JSON với envelope schema
+        # Parse JSON với envelope schema, giữ lại Kafka metadata để làm unique key
         parsed_stream = kafka_stream.select(
+            col("partition").alias("_kafka_partition"),
+            col("offset").alias("_kafka_offset"),
+            col("timestamp").alias("_kafka_timestamp"),
             from_json(col("value").cast("string"), envelope_schema).alias("data")
-        ).select("data.*")
+        ).select("_kafka_partition", "_kafka_offset", "_kafka_timestamp", "data.*")
 
         def process_batch(batch_df, batch_id):
             """Chỉ append vào Bronze — không MERGE, không transform"""
@@ -149,8 +152,8 @@ class KafkaToBronzeETL:
 
             batch_df.cache()
             try:
-                log_catalog = os.getenv("ICEBERG_LOG_CATALOG", "iceberg")
-                log_namespace = os.getenv("ICEBERG_LOG_NAMESPACE", "rawdata")
+                log_catalog = os.getenv("ICEBERG_CATALOG_BRONZE", "iceberg")
+                log_namespace = os.getenv("ICEBERG_NAMESPACE_BRONZE", "rawdata")
                 bronze_table = f"{log_catalog}.{log_namespace}.{table_name}"
 
                 # Detect source type
@@ -163,11 +166,13 @@ class KafkaToBronzeETL:
 
                 if is_goldengate:
                     bronze_df = batch_df.select(
-                        concat(lit(topic_name), lit("_"), lit(batch_id), lit("_"),
-                               col("op_ts")).alias("message_id"),
-                        lit(None).cast("int").alias("kafka_partition"),
-                        lit(None).cast("bigint").alias("kafka_offset"),
-                        lit(None).cast("timestamp").alias("kafka_timestamp"),
+                        concat(
+                            col("_kafka_partition").cast("string"), lit("_"),
+                            col("_kafka_offset").cast("string")
+                        ).alias("message_id"),
+                        col("_kafka_partition").cast("int").alias("kafka_partition"),
+                        col("_kafka_offset").cast("bigint").alias("kafka_offset"),
+                        col("_kafka_timestamp").cast("timestamp").alias("kafka_timestamp"),
                         lit("goldengate").alias("source_type"),
                         when(col("op_type") == "I", lit("insert"))
                         .when(col("op_type") == "U", lit("update"))
@@ -186,11 +191,13 @@ class KafkaToBronzeETL:
                 else:
                     # Debezium format
                     bronze_df = batch_df.select(
-                        concat(lit(topic_name), lit("_"), lit(batch_id), lit("_"),
-                               col("payload.ts_ms").cast("string")).alias("message_id"),
-                        lit(None).cast("int").alias("kafka_partition"),
-                        lit(None).cast("bigint").alias("kafka_offset"),
-                        lit(None).cast("timestamp").alias("kafka_timestamp"),
+                        concat(
+                            col("_kafka_partition").cast("string"), lit("_"),
+                            col("_kafka_offset").cast("string")
+                        ).alias("message_id"),
+                        col("_kafka_partition").cast("int").alias("kafka_partition"),
+                        col("_kafka_offset").cast("bigint").alias("kafka_offset"),
+                        col("_kafka_timestamp").cast("timestamp").alias("kafka_timestamp"),
                         lit("debezium").alias("source_type"),
                         when(col("payload.op") == "c", lit("insert"))
                         .when(col("payload.op") == "r", lit("insert"))
@@ -212,9 +219,28 @@ class KafkaToBronzeETL:
                     )
 
                 if not bronze_df.isEmpty():
-                    bronze_df.writeTo(bronze_table).append()
+                    # Dùng MERGE ON message_id để đảm bảo idempotency:
+                    # Nếu job crash sau khi write nhưng trước khi commit checkpoint,
+                    # batch sẽ được replay nhưng record đã có sẽ không bị ghi lại (WHEN NOT MATCHED)
+                    #
+                    # Dùng Global Temp View thay vì Session Temp View:
+                    # Khi active catalog là Iceberg, Spark resolve tên bảng trong Iceberg catalog
+                    # → session temp view bị "khuất" sau catalog namespace.
+                    # Global temp view luôn nằm trong database 'global_temp' built-in,
+                    # có thể truy cập được bất kể catalog hiện tại là gì.
+                    tmp_view = f"bronze_batch_{table_name}_{batch_id}"
+                    bronze_df.createOrReplaceGlobalTempView(tmp_view)
+                    try:
+                        self.spark.sql(f"""
+                            MERGE INTO {bronze_table} AS target
+                            USING global_temp.{tmp_view} AS source
+                            ON target.message_id = source.message_id
+                            WHEN NOT MATCHED THEN INSERT *
+                        """)
+                    finally:
+                        self.spark.catalog.dropGlobalTempView(tmp_view)
                     source_label = "GoldenGate" if is_goldengate else "Debezium"
-                    print(f"    ✓ [Bronze] Appended {bronze_df.count()} "
+                    print(f"    ✓ [Bronze] Merged {bronze_df.count()} "
                           f"{source_label} messages → {table_name} (batch {batch_id})")
 
             except Exception as e:
@@ -229,7 +255,7 @@ class KafkaToBronzeETL:
                 topic_config['expected_msg_per_day'])) \
             .option("checkpointLocation",
                     f"{self.checkpoint_base_dir}/bronze/{topic_name}") \
-            .queryName(f"bronze_{topic_name}") \
+            .queryName(f"bronze_{self.app_name}_{topic_name}") \
             .start()
 
         print(f"  ✓ [Bronze] Started stream: {topic_name} → rawdata.{table_name} (pool: {pool_name})")

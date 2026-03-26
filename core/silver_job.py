@@ -24,6 +24,59 @@ import os
 # Spark VARCHAR max length cho tất cả string columns
 _VARCHAR_MAX = 1048576
 
+# Kích thước mục tiêu cho mỗi partition trước khi MERGE (128 MB)
+_TARGET_PARTITION_BYTES = int(os.getenv("SILVER_TARGET_PARTITION_MB", "128")) * 1024 * 1024
+# Số partitions tối thiểu / tối đa để tránh quá ít hoặc quá nhiều task
+_MIN_PARTITIONS = int(os.getenv("SILVER_MIN_PARTITIONS", "8"))
+_MAX_PARTITIONS = int(os.getenv("SILVER_MAX_PARTITIONS", "400"))
+
+
+def _adaptive_repartition(df):
+    """
+    Tính số partitions phù hợp dựa trên kích thước ước lượng của DataFrame,
+    sau đó repartition nếu số partition hiện tại THẤP HƠN target.
+
+    Mục đích: tránh stage bị treo khi micro-batch có ít partitions (vd: 1)
+    do Iceberg scan chỉ trả về 1 file → 1 task → Exchange bottleneck.
+
+    Công thức: target_partitions = ceil(estimated_bytes / _TARGET_PARTITION_BYTES)
+    Clamp trong khoảng [_MIN_PARTITIONS, _MAX_PARTITIONS].
+
+    Notes:
+    - Thử SizeEstimator (JVM) trước; fallback về _MIN_PARTITIONS nếu thất bại.
+    - Luôn đảm bảo ít nhất _MIN_PARTITIONS partitions để tránh Exchange bottleneck.
+    - Gọi TRƯỚC localCheckpoint() để data được ghi ra đĩa với đủ partitions.
+    """
+    try:
+        current_partitions = df.rdd.getNumPartitions()
+        # Ước lượng kích thước — SizeEstimator có thể sai lệch nhưng đủ tốt
+        try:
+            estimated_bytes = df.sparkSession.sparkContext._jvm \
+                .org.apache.spark.util.SizeEstimator.estimate(df._jdf)
+        except Exception:
+            estimated_bytes = 0
+
+        if estimated_bytes > 0:
+            target = max(
+                _MIN_PARTITIONS,
+                min(_MAX_PARTITIONS, -(-estimated_bytes // _TARGET_PARTITION_BYTES))  # ceiling div
+            )
+        else:
+            # SizeEstimator thất bại → dùng _MIN_PARTITIONS làm sàn an toàn
+            target = _MIN_PARTITIONS
+
+        if current_partitions < target:
+            print(
+                f"    ℹ [Repartition] {current_partitions} → {target} partitions "
+                f"(estimated {estimated_bytes // (1024*1024)} MB, "
+                f"target {_TARGET_PARTITION_BYTES // (1024*1024)} MB/partition)"
+            )
+            return df.repartition(target)
+        return df
+    except Exception as e:
+        print(f"    ⚠ [Repartition] Lỗi, fallback repartition về {_MIN_PARTITIONS}: {e}")
+        return df.repartition(_MIN_PARTITIONS)
+
 
 def _spark_type_to_silver_ddl(data_type):
     """
@@ -225,6 +278,17 @@ class BronzeToSilverETL:
         try:
             self.spark.sql(f"DESCRIBE TABLE {full_table_name}")
             print(f"  ✓ Silver table exists: {table_name}")
+            # Đảm bảo bảng cũ cũng có auto-expire properties
+            # (tables được tạo trước version này chưa có 2 property này)
+            try:
+                self.spark.sql(f"""
+                    ALTER TABLE {full_table_name} SET TBLPROPERTIES (
+                        'history.expire.max-snapshot-age-ms' = '86400000',
+                        'history.expire.min-snapshots-to-keep' = '5'
+                    )
+                """)
+            except Exception:
+                pass
             return
         except Exception:
             pass
@@ -247,11 +311,75 @@ class BronzeToSilverETL:
         {partition_clause}
         TBLPROPERTIES (
             'write.format.default' = 'parquet',
-            'write.parquet.compression-codec' = 'snappy'
+            'write.parquet.compression-codec' = 'snappy',
+            'history.expire.max-snapshot-age-ms' = '86400000',
+            'history.expire.min-snapshots-to-keep' = '5'
         )
         """
         self.spark.sql(create_sql)
         print(f"  ✓ Created Silver table: {table_name}")
+
+    def _run_iceberg_maintenance(self, bronze_table: str, table_name: str):
+        """
+        Chạy Iceberg maintenance trên bảng BRONZE (rawdata) TRƯỚC khi stream.
+
+        Root cause: Bronze table được ghi liên tục từ Kafka streaming job.
+        Mỗi micro-batch = 1 snapshot mới → sau nhiều ngày có hàng nghìn snapshots
+        → Iceberg cần đọc hàng nghìn manifest files từ MinIO để plan scan
+        → mỗi file là 1 HTTP request riêng → stage Bronze scan chậm bất thường,
+          làm MERGE join phải chờ input từ bên Bronze → Stage 19 trông như "treo".
+
+        Lưu ý QUAN TRỌNG:
+        - KHÔNG expire Bronze snapshot chưa được Silver checkpoint xử lý!
+        - Silver CronJob chạy mỗi 5 phút, nên snapshot cũ hơn 24 giờ đã chắc chắn
+          được commit vào Silver → an toàn để expire.
+        - rewrite_manifests: luôn an toàn, không xóa snapshot nào, chỉ gộp
+          manifest files → giảm số HTTP requests khi Iceberg plan scan.
+
+        Giải pháp:
+        1. rewrite_manifests: gộp manifest files → luôn chạy trước.
+        2. expire_snapshots: xóa snapshots cũ hơn BRONZE_SNAPSHOT_MAX_AGE_HOURS (mặc định 24h),
+           giữ ít nhất BRONZE_SNAPSHOT_MIN_KEEP snapshots gần nhất (mặc định 10).
+        """
+        max_age_hours = int(os.getenv("BRONZE_SNAPSHOT_MAX_AGE_HOURS", "24"))
+        min_snapshots = int(os.getenv("BRONZE_SNAPSHOT_MIN_KEEP", "10"))
+        max_age_ms = max_age_hours * 3600 * 1000
+
+        try:
+            snapshot_count_df = self.spark.sql(
+                f"SELECT COUNT(*) as cnt FROM {bronze_table}.snapshots"
+            )
+            snapshot_count = snapshot_count_df.collect()[0]["cnt"]
+            print(f"  ℹ [Bronze Maintenance] {table_name}: {snapshot_count} snapshots")
+
+            # rewrite_manifests trước: tối ưu ngay cả khi snapshot count ít,
+            # giúp listố manifest files per snapshot giảm dù chưa expire snapshot nào.
+            rewrite_sql = f"CALL iceberg.system.rewrite_manifests(table => '{bronze_table}')"
+            self.spark.sql(rewrite_sql)
+            print(f"  ✓ [Bronze Maintenance] rewrite_manifests: hoàn tất")
+
+            if snapshot_count <= min_snapshots:
+                print(f"  ✓ [Bronze Maintenance] Bỏ qua expire — chỉ có {snapshot_count} snapshots (≤ {min_snapshots})")
+                return
+
+            from datetime import datetime, timezone, timedelta
+            older_than_dt = datetime.now(timezone.utc) - timedelta(milliseconds=max_age_ms)
+            older_than_str = older_than_dt.strftime("%Y-%m-%d %H:%M:%S")
+            expire_sql = f"""
+            CALL iceberg.system.expire_snapshots(
+                table => '{bronze_table}',
+                older_than => TIMESTAMP '{older_than_str}',
+                retain_last => {min_snapshots}
+            )
+            """
+            result = self.spark.sql(expire_sql).collect()
+            deleted_files = result[0][0] if result else 0
+            print(f"  ✓ [Bronze Maintenance] expire_snapshots: đã xóa {deleted_files} files cũ hơn {max_age_hours}h")
+
+        except Exception as e:
+            print(f"  ⚠ [Bronze Maintenance] Lỗi maintenance {table_name} (bỏ qua): {e}")
+
+
 
     # ------------------------------------------------------------------
     # Stream processing
@@ -278,14 +406,10 @@ class BronzeToSilverETL:
         print(f"    Checkpoint: {checkpoint_dir}")
 
         def process_micro_batch(batch_df, batch_id):
+            print(f"    → [MicroBatch {batch_id}] START — checkpoint offsets ghi rồi, đang xử lý...")
             if batch_df.isEmpty():
                 return
 
-            # QUAN TRỌNG: Spark Streaming tạo một SparkSession con (cloned session) cho
-            # mỗi micro-batch. batch_df thuộc session này. createOrReplaceTempView() đăng ký
-            # view vào session đó. Nếu dùng self.spark (main session) để chạy SQL, view sẽ
-            # không tìm thấy vì là 2 session khác nhau → TABLE_OR_VIEW_NOT_FOUND.
-            # Giải pháp: luôn dùng batch_df.sparkSession cho mọi SQL trong foreachBatch.
             spark = batch_df.sparkSession
 
             # Tắt broadcast join tại session level — đảm bảo cloned batch session
@@ -293,9 +417,20 @@ class BronzeToSilverETL:
             # Broadcast join trên bảng lớn gây treo executor không có log.
             spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
             spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
+            # Tắt AQE coalescePartitions trên batch session:
+            # Sau khi scan Silver table (Stage 19), AQE có thể gộp 200 shuffle partitions
+            # về 1~24 partitions vì thấy data nhỏ → Exchange bị bottleneck → stage treo.
+            # Tắt để giữ nguyên spark.sql.shuffle.partitions=200 cho toàn bộ MERGE plan.
+            spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "false")
+
+            raw_partitions = batch_df.rdd.getNumPartitions()
+            if raw_partitions < _MIN_PARTITIONS:
+                print(f"    ℹ [BatchDF] Iceberg scan trả về {raw_partitions} partition(s) → force repartition → {_MIN_PARTITIONS}")
+                batch_df = batch_df.repartition(_MIN_PARTITIONS)
 
             # Persist the microbatch because we will apply multiple filters and actions
             # (insert / update / delete filters đều đọc lại batch_df)
+            batch_df = _adaptive_repartition(batch_df)
             batch_df.persist()
             total_count = batch_df.count()
 
@@ -305,189 +440,161 @@ class BronzeToSilverETL:
 
             print(f"    → [MicroBatch {batch_id}] Found {total_count} messages to process")
 
-            # Chỉ parse-on-the-fly từ batch_df đã persist — KHÔNG cache thêm
-            # vì mỗi parsed DF chỉ dùng 1 lần cho 1 operation type.
-            # Việc cache quá nhiều DF lồng nhau gây GC overhead nặng trên bảng lớn.
-            after_parsed = (
-                batch_df
-                .filter(col("after_data").isNotNull())
-                .select(
-                    col("operation"),
-                    col("op_ts"),  # giữ lại để dedup theo thứ tự CDC
-                    from_json(col("after_data"), data_schema).alias("after_struct")
-                )
-                .select("operation", "op_ts", "after_struct.*")
-            )
-
-            before_parsed = (
-                batch_df
-                .filter(col("before_data").isNotNull())
-                .select(
-                    col("operation"),
-                    col("op_ts"),  # giữ lại để dedup theo thứ tự CDC
-                    from_json(col("before_data"), data_schema).alias("before_struct")
-                )
-                .select("operation", "op_ts", "before_struct.*")
-            )
-
-            # ====== 1. Inserts ======
-            # Dùng MERGE INTO (upsert) thay vì .append() để đảm bảo idempotent:
-            # nếu checkpoint bị mất và job chạy lại từ đầu, các dòng insert đã tồn tại
-            # sẽ bị UPDATE thay vì tạo bản ghi trùng lặp.
-            # Fallback về .append() chỉ khi không có primary key
-            inserts_df = after_parsed.filter(col("operation") == "insert").drop("operation")
-            inserts_df_count = inserts_df.count()
-            print(f"      [Batch {batch_id}] inserts count: {inserts_df_count}")
-            if inserts_df_count > 0:
+            try:
                 if not primary_keys:
-                    # Không có primary key → không thể deduplicate, cứ append
-                    # ⚠ WARNING: có thể bị trùng nếu mất checkpoint
+                    # ====================================================
+                    # Không có primary key: fallback về append-only
+                    # (chỉ insert, không update/delete vì không có PK để match)
+                    # ====================================================
+                    after_parsed = (
+                        batch_df
+                        .filter((col("after_data").isNotNull()) & (col("operation") == "insert"))
+                        .select(from_json(col("after_data"), data_schema).alias("s"))
+                        .select("s.*")
+                    )
+                    inserts_casted = self.cast_to_table_schema(after_parsed, table_name, namespace)
                     print(f"      ⚠ WARNING: No primary keys for {table_name} — INSERT uses append (not idempotent)")
-                    inserts_no_ts = inserts_df.drop("op_ts")
-                    inserts_casted = self.cast_to_table_schema(inserts_no_ts, table_name, namespace)
                     inserts_casted.writeTo(silver_table).append()
-                    print(f"      - Appended {inserts_df_count} rows → {table_name}")
+                    print(f"      - Appended rows → {table_name}")
                 else:
-                    # Dedup theo PK TRƯỚC KHI cast — op_ts phải còn tồn tại lúc orderBy
+                    # ====================================================
+                    # UNIFIED SINGLE MERGE: gộp insert + update + delete
+                    # vào 1 MERGE duy nhất → Silver table chỉ bị scan 1 lần
+                    # thay vì 3 lần như trước (3 lần full scan + 3 shuffle join).
+                    #
+                    # Chiến lược:
+                    #   - after_data  (insert/update): lấy data mới nhất
+                    #   - before_data (delete):        lấy PK để match xóa
+                    #   - UNION ALL rồi dedup theo PK + op_ts DESC
+                    #     → mỗi PK chỉ còn 1 row với operation cuối cùng
+                    #   - _merge_op = 'delete' → WHEN MATCHED THEN DELETE
+                    #   - _merge_op = 'insert'/'update' → WHEN MATCHED THEN UPDATE
+                    #                                      WHEN NOT MATCHED THEN INSERT
+                    # ====================================================
                     keys = [k.strip() for k in primary_keys.split(",")]
+
+                    after_parsed = (
+                        batch_df
+                        .filter(col("after_data").isNotNull())
+                        .select(
+                            col("operation").alias("_merge_op"),
+                            col("op_ts"),
+                            from_json(col("after_data"), data_schema).alias("_s")
+                        )
+                        .select("_merge_op", "op_ts", "_s.*")
+                    )
+
+                    # before_data: chỉ dùng cho delete — lấy PK + fill NULL cho non-PK cols
+                    # để schema khớp với after_parsed khi UNION ALL
+                    non_key_cols = [f.name for f in data_schema.fields if f.name not in keys]
+                    before_parsed = (
+                        batch_df
+                        .filter(
+                            (col("before_data").isNotNull()) &
+                            (col("operation") == "delete")
+                        )
+                        .select(
+                            col("operation").alias("_merge_op"),
+                            col("op_ts"),
+                            from_json(col("before_data"), data_schema).alias("_s")
+                        )
+                        .select(
+                            "_merge_op", "op_ts",
+                            *[col(f"_s.{k}") for k in keys],
+                            *[lit(None).cast(data_schema[c].dataType).alias(c) for c in non_key_cols]
+                        )
+                    )
+
+                    # UNION ALL sau đó dedup: mỗi PK chỉ giữ event có op_ts lớn nhất
+                    all_ops = after_parsed.unionByName(before_parsed)
                     window = Window.partitionBy(*keys).orderBy(desc("op_ts"))
-                    inserts_deduped_raw = (
-                        inserts_df
+                    deduped_raw = (
+                        all_ops
                         .withColumn("_rn", row_number().over(window))
                         .filter(col("_rn") == 1)
-                        .drop("_rn", "op_ts")  # bỏ op_ts trước khi cast vào Silver
+                        .drop("_rn", "op_ts")
                     )
-                    # Cast về Silver schema SAU KHI đã dedup và drop op_ts
-                    inserts_deduped = self.cast_to_table_schema(inserts_deduped_raw, table_name, namespace)
-                    # Checkpoint (persist) trước khi tạo view để MERGE đọc data đã materialized
-                    inserts_deduped = inserts_deduped.localCheckpoint()
-                    inserts_count = inserts_deduped.count()
-                    inserts_view = f"silver_inserts_tmp_{batch_id}"
-                    inserts_deduped.createOrReplaceTempView(inserts_view)
+
+                    # Cast về Silver schema (giữ lại _merge_op để dùng trong MERGE condition)
+                    data_cols = [f.name for f in data_schema.fields]
+                    deduped_data = self.cast_to_table_schema(
+                        deduped_raw.select(*data_cols),
+                        table_name, namespace
+                    )
+                    # Đính kèm lại _merge_op sau khi cast
+                    deduped_final = deduped_data.join(
+                        deduped_raw.select(*keys, "_merge_op"),
+                        on=keys,
+                        how="left"
+                    )
+
+                    # Materialize trước MERGE để tránh re-compute
+                    deduped_final = _adaptive_repartition(deduped_final)
+                    deduped_final = deduped_final.localCheckpoint()
+                    source_count = deduped_final.count()
+                    delete_count = deduped_final.filter(col("_merge_op") == "delete").count()
+                    upsert_count = source_count - delete_count
+                    print(f"      [Batch {batch_id}] Unified source: {source_count} rows "
+                          f"(upsert={upsert_count}, delete={delete_count}) → {table_name}")
+
+                    unified_view = f"silver_unified_tmp_{batch_id}"
+                    deduped_final.createOrReplaceTempView(unified_view)
                     try:
                         key_ddl_types = self._get_silver_key_ddl_types(silver_table, keys)
                         on_clause = self._build_null_safe_on_clause(keys, key_ddl_types)
-                        all_cols = [f.name for f in inserts_deduped.schema.fields]
-                        set_clauses = [f"t.{c} = s.{c}" for c in all_cols]
-                        insert_cols_sql = ", ".join(all_cols)
-                        values_sql = ", ".join([f"s.{c}" for c in all_cols])
 
-                        print(f"      [Batch {batch_id}] Running INSERT MERGE ({inserts_count} rows) → {table_name}")
+                        all_data_cols = [f.name for f in deduped_final.schema.fields if f.name != "_merge_op"]
+                        # UPDATE SET: insert/update → dùng s.col trực tiếp (đã cast)
+                        upsert_set = ", ".join([f"t.{c} = s.{c}" for c in all_data_cols])
+                        insert_cols_sql = ", ".join(all_data_cols)
+                        values_sql = ", ".join([f"s.{c}" for c in all_data_cols])
+
+                        print(f"      [Batch {batch_id}] Running UNIFIED MERGE → {table_name}")
                         merge_sql = f"""
                         MERGE INTO {silver_table} t
-                        USING {inserts_view} s
+                        USING {unified_view} s
                         ON {on_clause}
-                        WHEN MATCHED THEN
-                            UPDATE SET {", ".join(set_clauses)}
-                        WHEN NOT MATCHED THEN
+                        WHEN MATCHED AND s._merge_op = 'delete' THEN
+                            DELETE
+                        WHEN MATCHED AND s._merge_op != 'delete' THEN
+                            UPDATE SET {upsert_set}
+                        WHEN NOT MATCHED AND s._merge_op != 'delete' THEN
                             INSERT ({insert_cols_sql})
                             VALUES ({values_sql})
                         """
-                        spark.sql(merge_sql)  # dùng batch session, không phải self.spark
-                        print(f"      - Upserted (INSERT/idempotent) {inserts_count} rows → {table_name}")
+                        spark.sql(merge_sql)
+                        print(f"      ✓ [Batch {batch_id}] UNIFIED MERGE done: "
+                              f"upserted {upsert_count}, deleted {delete_count} rows → {table_name}")
                     finally:
-                        spark.catalog.dropTempView(inserts_view)
+                        spark.catalog.dropTempView(unified_view)
+                        deduped_final.unpersist()
 
-            # ====== 2. Updates (MERGE UPSERT) ======
-            updates_df = after_parsed.filter(col("operation") == "update").drop("operation")
-            updates_df_count = updates_df.count()
-            print(f"      [Batch {batch_id}] updates count: {updates_df_count}")
-            if updates_df_count > 0:
-                if not primary_keys:
-                    print(f"      ⚠ WARNING: No keys for upsert on {table_name}, skipping updates")
-                else:
-                    # Dedup theo PK TRƯỚC KHI cast — op_ts phải còn tồn tại lúc orderBy
-                    keys = [k.strip() for k in primary_keys.split(",")]
-                    window = Window.partitionBy(*keys).orderBy(desc("op_ts"))
-                    updates_deduped_raw = (
-                        updates_df
-                        .withColumn("_rn", row_number().over(window))
-                        .filter(col("_rn") == 1)
-                        .drop("_rn", "op_ts")  # bỏ op_ts trước khi cast vào Silver
-                    )
-                    # Cast về Silver schema SAU KHI đã dedup và drop op_ts
-                    updates_deduped = self.cast_to_table_schema(updates_deduped_raw, table_name, namespace)
-                    updates_deduped = updates_deduped.localCheckpoint()
-                    updates_count = updates_deduped.count()
-                    updates_view = f"silver_updates_tmp_{batch_id}"
-                    updates_deduped.createOrReplaceTempView(updates_view)
-                    try:
-                        key_ddl_types = self._get_silver_key_ddl_types(silver_table, keys)
-                        on_clause = self._build_null_safe_on_clause(keys, key_ddl_types)
-                        set_clauses = [
-                            f"t.{f.name} = COALESCE(s.{f.name}, t.{f.name})"
-                            for f in updates_deduped.schema.fields
-                        ]
-                        insert_cols = [f.name for f in updates_deduped.schema.fields]
+            finally:
+                # QUAN TRỌNG: Đảm bảo batch_df luôn được unpersist dù có exception hay không.
+                # Nếu không gọi, executor memory sẽ bị giữ cho đến khi GC tự thu hồi.
+                batch_df.unpersist()
 
-                        print(f"      [Batch {batch_id}] Running UPDATE MERGE ({updates_count} rows) → {table_name}")
-                        merge_sql = f"""
-                        MERGE INTO {silver_table} t
-                        USING {updates_view} s
-                        ON {on_clause}
-                        WHEN MATCHED THEN
-                            UPDATE SET {", ".join(set_clauses)}
-                        WHEN NOT MATCHED THEN
-                            INSERT ({", ".join(insert_cols)})
-                            VALUES ({", ".join(["s." + c for c in insert_cols])})
-                        """
-                        spark.sql(merge_sql)  # dùng batch session, không phải self.spark
-                        print(f"      - Merged {updates_count} rows → {table_name}")
-                    finally:
-                        spark.catalog.dropTempView(updates_view)
-
-            # ====== 3. Deletes ======
-            deletes_df = before_parsed.filter(col("operation") == "delete").drop("operation")
-            deletes_df_count = deletes_df.count()
-            print(f"      [Batch {batch_id}] deletes count: {deletes_df_count}")
-            if deletes_df_count > 0:
-                if not primary_keys:
-                    print(f"      ⚠ WARNING: No keys for delete on {table_name}, skipping deletes")
-                else:
-                    # Dedup theo PK TRƯỚC KHI cast — op_ts phải còn tồn tại lúc orderBy
-                    keys = [k.strip() for k in primary_keys.split(",")]
-                    window = Window.partitionBy(*keys).orderBy(desc("op_ts"))
-                    deletes_deduped_raw = (
-                        deletes_df
-                        .withColumn("_rn", row_number().over(window))
-                        .filter(col("_rn") == 1)
-                        .drop("_rn", "op_ts")  # chỉ cần PK để match, drop op_ts
-                    )
-                    # Cast về Silver schema SAU KHI đã dedup và drop op_ts
-                    deletes_deduped = self.cast_to_table_schema(deletes_deduped_raw, table_name, namespace)
-                    deletes_deduped = deletes_deduped.localCheckpoint()
-                    deletes_count = deletes_deduped.count()
-                    deletes_view = f"silver_deletes_tmp_{batch_id}"
-                    deletes_deduped.createOrReplaceTempView(deletes_view)
-                    try:
-                        key_ddl_types = self._get_silver_key_ddl_types(silver_table, keys)
-                        on_clause = self._build_null_safe_on_clause(keys, key_ddl_types)
-
-                        print(f"      [Batch {batch_id}] Running DELETE MERGE ({deletes_count} rows) → {table_name}")
-                        delete_sql = f"""
-                        MERGE INTO {silver_table} t
-                        USING {deletes_view} s
-                        ON {on_clause}
-                        WHEN MATCHED THEN DELETE
-                        """
-                        spark.sql(delete_sql)  # dùng batch session, không phải self.spark
-                        print(f"      - Deleted {deletes_count} rows from {table_name}")
-                    finally:
-                        spark.catalog.dropTempView(deletes_view)
-
-            batch_df.unpersist()
+            # Nếu log này KHÔNG xuất hiện trước khi pod die → batch chưa commit
+            # → Spark sẽ replay batch này khi restart
+            print(f"    ✓ [MicroBatch {batch_id}] DONE — Spark sẽ ghi commits/{batch_id} ngay sau đây")
 
         try:
-            # Khởi động Structured Streaming với AvailableNow
-            # streaming-skip-delete-snapshots=true : bỏ qua các Iceberg delete snapshots
-            #   (sinh ra khi Bronze table có MERGE/DELETE row-level), tránh lỗi:
-            #   IllegalStateException: Cannot process delete snapshot
-            # streaming-skip-overwrite-snapshots=true : bỏ qua overwrite snapshots tương tự
+
+            max_files = int(os.getenv("SILVER_MAX_FILES_PER_TRIGGER", "10"))
+            max_bytes = int(os.getenv("SILVER_MAX_BYTES_PER_TRIGGER", str(512 * 1024 * 1024)))  # 512MB default
+
+            # Log trạng thái checkpoint hiện tại trước khi start
+            # Giúp biết lần này là lần đầu hay đang resume từ checkpoint cũ
+            import os as _os
+
+
             stream_query = (
                 self.spark.readStream
                 .format("iceberg")
                 .option("streaming-skip-delete-snapshots", "true")
                 .option("streaming-skip-overwrite-snapshots", "true")
+                .option("max-files-per-trigger", max_files)
+                .option("max-bytes-per-trigger", max_bytes)
                 .load(bronze_table)
                 .writeStream
                 .foreachBatch(process_micro_batch)
@@ -495,6 +602,7 @@ class BronzeToSilverETL:
                 .trigger(availableNow=True)
                 .start()
             )
+            print(f"    ℹ Stream started: max-files-per-trigger={max_files}, max-bytes-per-trigger={max_bytes // (1024*1024)}MB")
 
             stream_query.awaitTermination()
         except Exception as e:
@@ -546,6 +654,10 @@ class BronzeToSilverETL:
                 error_count += 1
                 continue
             try:
+                log_catalog = os.getenv("ICEBERG_LOG_CATALOG", "iceberg")
+                log_namespace = os.getenv("ICEBERG_LOG_NAMESPACE", "rawdata")
+                bronze_table = f"{log_catalog}.{log_namespace}.{config['table_name']}"
+                self._run_iceberg_maintenance(bronze_table, config['table_name'])
                 self.process_topic_stream(config, topic_schemas[topic_name])
                 success_count += 1
             except Exception as e:
@@ -553,6 +665,16 @@ class BronzeToSilverETL:
                 print(f"  ✗ Failed to process topic {topic_name}: {e}")
                 print(traceback.format_exc())
                 error_count += 1
+            finally:
+                # Giải phóng toàn bộ Spark cache sau mỗi topic để tránh memory tích lũy
+                # giữa các topic khi chạy tuần tự.
+                self.spark.catalog.clearCache()
+                try:
+                    # Gợi ý JVM GC để thu hồi bộ nhớ trước khi topic tiếp theo bắt đầu
+                    self.spark.sparkContext._jvm.System.gc()
+                except Exception:
+                    pass
+                print(f"  ℹ [Memory] Cache cleared after topic: {topic_name}")
 
         print(f"\n========================================")
         print(f"[SILVER JOB] Completed: {self.app_name}")

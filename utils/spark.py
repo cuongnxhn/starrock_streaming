@@ -23,7 +23,8 @@ def create_spark_session(app_name, app_config):
         .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2") \
         .config("spark.sql.catalogImplementation", "in-memory") \
         .config("spark.hadoop.yarn.timeline-service.enabled", "false") \
-        .config("spark.eventLog.enabled", "false") \
+        .config("spark.eventLog.enabled", "true") \
+        .config("spark.eventLog.dir", "s3a://iceberg/spark-events") \
         .config("spark.ui.enabled", "true") \
         .config("spark.ui.showConsoleProgress", "false") \
         \
@@ -40,13 +41,20 @@ def create_spark_session(app_name, app_config):
         .config("spark.hadoop.fs.s3a.block.size", "67108864") \
         .config("spark.hadoop.fs.s3a.fast.upload.buffer", "array") \
         \
-        .config("spark.sql.extensions", 
+        .config("spark.sql.extensions",
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
         .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog") \
         .config("spark.sql.catalog.iceberg.type", "rest") \
         .config("spark.sql.catalog.iceberg.uri", iceberg_rest_uri) \
         .config("spark.sql.catalog.iceberg.warehouse", iceberg_warehouse) \
         .config("spark.sql.catalog.iceberg.cache-enabled", "true")
+
+    # Fix NoClassDefFoundError: software/amazon/awssdk/services/s3/model/S3Exception
+    # Iceberg ResolvingFileIO dynamically loads AWS SDK v2 S3FileIO at runtime.
+    # Since we only have SDK v1 (aws-java-sdk-bundle), force HadoopFileIO
+    # which uses S3A (hadoop-aws) + SDK v1 — no SDK v2 dependency needed.
+    conf_builder = conf_builder \
+        .config("spark.sql.catalog.iceberg.io-impl", "org.apache.iceberg.hadoop.HadoopFileIO")
 
     # Apply dynamic config from database
     conf_builder = conf_builder \
@@ -68,7 +76,13 @@ def create_spark_session(app_name, app_config):
         \
         .config("spark.sql.files.maxPartitionBytes", "134217728") \
         .config("spark.sql.adaptive.enabled", "true") \
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "false") \
+        .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64mb") \
+        .config("spark.sql.iceberg.merge.cardinality-check.enabled", "false") \
+        .config("spark.sql.iceberg.check-ordering-by-write-mode", "false") \
+        \
+        .config("spark.sql.iceberg.split-size", "8388608") \
+        .config("spark.sql.iceberg.split-open-file-cost", "0") \
         \
         .config("spark.kubernetes.executor.deleteOnTermination", "true") \
         .config("spark.kubernetes.submission.waitAppCompletion", "false") \

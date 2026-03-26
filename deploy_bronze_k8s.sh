@@ -124,6 +124,8 @@ spec:
         - --conf
         - spark.kubernetes.executor.deleteOnTermination=true
         - --conf
+        - spark.kubernetes.executor.deleteOrphanPods=true
+        - --conf
         - spark.kubernetes.executor.secrets.app-env-secret=/mnt/secrets
         - --conf
         - spark.kubernetes.driver.podTemplateFile=/app/k8s/spark-driver-pod-template.yaml
