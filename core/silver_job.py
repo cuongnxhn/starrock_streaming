@@ -19,7 +19,11 @@ from pyspark.sql import Window
 from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType, VarcharType
 )
+from core.schema_evolution import (
+    SchemaFetcher, SchemaChangeDetector, SchemaEvolutionManager
+)
 import os
+import time
 
 # Spark VARCHAR max length cho tất cả string columns
 _VARCHAR_MAX = 1048576
@@ -271,15 +275,31 @@ class BronzeToSilverETL:
             )
         return " AND ".join(conditions)
 
-    def create_silver_table_if_not_exists(self, database, table_name, data_schema, partition_cols):
+    def _get_current_silver_schema(self, full_table_name: str) -> StructType:
+        try:
+            return self.spark.table(full_table_name).schema
+        except Exception:
+            return None
+
+    def ensure_silver_table_schema(self, database, table_name, data_schema, partition_cols, topic_config):
         catalog = os.getenv("ICEBERG_CATALOG", "iceberg")
         full_table_name = f"{catalog}.{database}.{table_name}"
 
-        try:
-            self.spark.sql(f"DESCRIBE TABLE {full_table_name}")
+        # Fetch actual schema from config or source depending on schema_fetch_mode
+        fetcher = SchemaFetcher(topic_config)
+        actual_schema = fetcher.fetch(self.spark)
+        if actual_schema is None:
+            actual_schema = data_schema
+
+        if actual_schema is None:
+            print(f"  ⚠ WARNING: Không xác định được schema cho {table_name}")
+            return None
+
+        current_schema = self._get_current_silver_schema(full_table_name)
+        
+        if current_schema:
             print(f"  ✓ Silver table exists: {table_name}")
-            # Đảm bảo bảng cũ cũng có auto-expire properties
-            # (tables được tạo trước version này chưa có 2 property này)
+            # Ensure properties
             try:
                 self.spark.sql(f"""
                     ALTER TABLE {full_table_name} SET TBLPROPERTIES (
@@ -289,10 +309,45 @@ class BronzeToSilverETL:
                 """)
             except Exception:
                 pass
-            return
-        except Exception:
-            pass
+                
+            detector = SchemaChangeDetector()
+            report = detector.detect(current_schema, actual_schema)
+            
+            strategy = topic_config.get('schema_change_strategy', os.getenv('SILVER_SCHEMA_CHANGE_STRATEGY', 'alter_only'))
+            allow_drop_str = str(topic_config.get('allow_drop_column', os.getenv('SILVER_ALLOW_DROP_COLUMN', 'false')))
+            allow_drop = allow_drop_str.lower() == 'true'
+            
+            manager = SchemaEvolutionManager(self.spark)
+            needs_recreate = manager.apply(
+                full_table_name, report, strategy, allow_drop, 
+                database, table_name, partition_cols, _spark_type_to_silver_ddl
+            )
+            
+            if needs_recreate:
+                print(f"  ℹ Recreating table {full_table_name} due to schema changes.")
+                bak_table_name = f"{full_table_name}_bak_{int(time.time())}"
+                
+                # 1. Đọc Silver table cũ → old_df
+                old_df = self.spark.table(full_table_name)
+                
+                # 2. Rename Silver table cũ
+                self.spark.sql(f"ALTER TABLE {full_table_name} RENAME TO {bak_table_name}")
+                
+                # 3. Create NEW table with actual_schema
+                self._create_iceberg_table(full_table_name, actual_schema, partition_cols)
+                
+                # 4. Cast old_df to actual_schema and overwrite
+                casted_df = self.cast_to_table_schema(old_df, table_name, database)
+                casted_df.writeTo(full_table_name).overwritePartitions()
+                
+                print(f"  ✓ Recreated {table_name} successfully.")
+                
+            return actual_schema
+        else:
+            self._create_iceberg_table(full_table_name, actual_schema, partition_cols)
+            return actual_schema
 
+    def _create_iceberg_table(self, full_table_name, data_schema, partition_cols):
         fields = []
         for field in data_schema.fields:
             ddl_type = _spark_type_to_silver_ddl(field.dataType)
@@ -317,7 +372,7 @@ class BronzeToSilverETL:
         )
         """
         self.spark.sql(create_sql)
-        print(f"  ✓ Created Silver table: {table_name}")
+        print(f"  ✓ Created Silver table: {full_table_name}")
 
     def _run_iceberg_maintenance(self, bronze_table: str, table_name: str):
         """
@@ -635,14 +690,18 @@ class BronzeToSilverETL:
                 print(f"  ⚠ WARNING: Skipping '{topic_name}' — không xác định được schema từ Bronze")
                 continue
 
-            topic_schemas[topic_name] = data_schema
-
-            self.create_silver_table_if_not_exists(
+            actual_schema = self.ensure_silver_table_schema(
                 namespace,
                 table_name,
                 data_schema,
-                config['partition_columns']
+                config['partition_columns'],
+                config
             )
+            
+            if actual_schema:
+                topic_schemas[topic_name] = actual_schema
+            elif data_schema:
+                topic_schemas[topic_name] = data_schema
 
         print("\nProcessing topics (Streaming AvailableNow)...")
         success_count = 0
