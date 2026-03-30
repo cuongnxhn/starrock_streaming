@@ -48,7 +48,7 @@ class AppConfig:
             """
             topics_df = temp_spark.read.jdbc(url=jdbc_url, table=query_topics, properties=jdbc_properties)
 
-            self.topic_configs = topics_df.collect()
+            self.topic_configs = [row.asDict() for row in topics_df.collect()]
             print(f"✓ Loaded {len(self.topic_configs)} topics for {self.app_name}")
             
         finally:

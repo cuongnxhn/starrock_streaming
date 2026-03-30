@@ -260,8 +260,8 @@ class BronzeToSilverETL:
         Sinh ON clause với:
         - CAST(s.k AS <ddl_type>) để ép kiểu source về đúng kiểu của Silver table,
           tránh duplicate do type mismatch (vd: string '2230248' vs decimal).
-        - NULL-safe equality: (t.k = s_cast OR (t.k IS NULL AND s_cast IS NULL))
-          tránh duplicate khi cột key có giá trị NULL.
+        - NULL-safe equality: t.k <=> s_cast (<=> is Spark SQL null-safe equals)
+          tránh duplicate khi cột key có giá trị NULL và giúp Spark nhận diện EquiJoin.
         """
         conditions = []
         for k in keys:
@@ -271,7 +271,7 @@ class BronzeToSilverETL:
             else:
                 s_expr = f"s.{k}"
             conditions.append(
-                f"(t.{k} = {s_expr} OR (t.{k} IS NULL AND {s_expr} IS NULL))"
+                f"(t.{k} <=> {s_expr})"
             )
         return " AND ".join(conditions)
 
@@ -374,27 +374,25 @@ class BronzeToSilverETL:
         self.spark.sql(create_sql)
         print(f"  ✓ Created Silver table: {full_table_name}")
 
-    def _run_iceberg_maintenance(self, bronze_table: str, table_name: str):
+    def _run_rewrite_manifests(self, bronze_table: str, table_name: str):
         """
-        Chạy Iceberg maintenance trên bảng BRONZE (rawdata) TRƯỚC khi stream.
+        Chạy Iceberg rewrite_manifests trên bảng BRONZE (rawdata) TRƯỚC khi stream
+        để giảm số lượng file manifest, giúp Iceberg plan scan nhanh hơn.
+        Luôn an toàn, không xóa snapshot nào.
+        """
+        try:
+            print(f"  ℹ [Bronze Maintenance] Running rewrite_manifests for {table_name}")
+            rewrite_sql = f"CALL iceberg.system.rewrite_manifests(table => '{bronze_table}')"
+            self.spark.sql(rewrite_sql)
+            print(f"  ✓ [Bronze Maintenance] rewrite_manifests: hoàn tất")
+        except Exception as e:
+            print(f"  ⚠ [Bronze Maintenance] Lỗi rewrite_manifests {table_name} (bỏ qua): {e}")
 
-        Root cause: Bronze table được ghi liên tục từ Kafka streaming job.
-        Mỗi micro-batch = 1 snapshot mới → sau nhiều ngày có hàng nghìn snapshots
-        → Iceberg cần đọc hàng nghìn manifest files từ MinIO để plan scan
-        → mỗi file là 1 HTTP request riêng → stage Bronze scan chậm bất thường,
-          làm MERGE join phải chờ input từ bên Bronze → Stage 19 trông như "treo".
-
-        Lưu ý QUAN TRỌNG:
-        - KHÔNG expire Bronze snapshot chưa được Silver checkpoint xử lý!
-        - Silver CronJob chạy mỗi 5 phút, nên snapshot cũ hơn 24 giờ đã chắc chắn
-          được commit vào Silver → an toàn để expire.
-        - rewrite_manifests: luôn an toàn, không xóa snapshot nào, chỉ gộp
-          manifest files → giảm số HTTP requests khi Iceberg plan scan.
-
-        Giải pháp:
-        1. rewrite_manifests: gộp manifest files → luôn chạy trước.
-        2. expire_snapshots: xóa snapshots cũ hơn BRONZE_SNAPSHOT_MAX_AGE_HOURS (mặc định 24h),
-           giữ ít nhất BRONZE_SNAPSHOT_MIN_KEEP snapshots gần nhất (mặc định 10).
+    def _run_expire_snapshots(self, bronze_table: str, table_name: str):
+        """
+        Chạy Iceberg expire_snapshots SAU KHI stream đã hoàn tất.
+        Điều này đảm bảo offset checkpoint đã được tiến lên snapshot mới nhất,
+        tránh việc xóa nhầm snapshot cũ mà streaming checkpoint vẫn đang cần đọc.
         """
         max_age_hours = int(os.getenv("BRONZE_SNAPSHOT_MAX_AGE_HOURS", "24"))
         min_snapshots = int(os.getenv("BRONZE_SNAPSHOT_MIN_KEEP", "10"))
@@ -405,13 +403,6 @@ class BronzeToSilverETL:
                 f"SELECT COUNT(*) as cnt FROM {bronze_table}.snapshots"
             )
             snapshot_count = snapshot_count_df.collect()[0]["cnt"]
-            print(f"  ℹ [Bronze Maintenance] {table_name}: {snapshot_count} snapshots")
-
-            # rewrite_manifests trước: tối ưu ngay cả khi snapshot count ít,
-            # giúp listố manifest files per snapshot giảm dù chưa expire snapshot nào.
-            rewrite_sql = f"CALL iceberg.system.rewrite_manifests(table => '{bronze_table}')"
-            self.spark.sql(rewrite_sql)
-            print(f"  ✓ [Bronze Maintenance] rewrite_manifests: hoàn tất")
 
             if snapshot_count <= min_snapshots:
                 print(f"  ✓ [Bronze Maintenance] Bỏ qua expire — chỉ có {snapshot_count} snapshots (≤ {min_snapshots})")
@@ -432,7 +423,7 @@ class BronzeToSilverETL:
             print(f"  ✓ [Bronze Maintenance] expire_snapshots: đã xóa {deleted_files} files cũ hơn {max_age_hours}h")
 
         except Exception as e:
-            print(f"  ⚠ [Bronze Maintenance] Lỗi maintenance {table_name} (bỏ qua): {e}")
+            print(f"  ⚠ [Bronze Maintenance] Lỗi expire_snapshots {table_name} (bỏ qua): {e}")
 
 
 
@@ -467,11 +458,6 @@ class BronzeToSilverETL:
 
             spark = batch_df.sparkSession
 
-            # Tắt broadcast join tại session level — đảm bảo cloned batch session
-            # không tự động dùng broadcast (có thể không kế thừa từ spark-submit conf).
-            # Broadcast join trên bảng lớn gây treo executor không có log.
-            spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-            spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
             # Tắt AQE coalescePartitions trên batch session:
             # Sau khi scan Silver table (Stage 19), AQE có thể gộp 200 shuffle partitions
             # về 1~24 partitions vì thấy data nhỏ → Exchange bị bottleneck → stage treo.
@@ -716,8 +702,9 @@ class BronzeToSilverETL:
                 log_catalog = os.getenv("ICEBERG_LOG_CATALOG", "iceberg")
                 log_namespace = os.getenv("ICEBERG_LOG_NAMESPACE", "rawdata")
                 bronze_table = f"{log_catalog}.{log_namespace}.{config['table_name']}"
-                self._run_iceberg_maintenance(bronze_table, config['table_name'])
+                self._run_rewrite_manifests(bronze_table, config['table_name'])
                 self.process_topic_stream(config, topic_schemas[topic_name])
+                self._run_expire_snapshots(bronze_table, config['table_name'])
                 success_count += 1
             except Exception as e:
                 import traceback

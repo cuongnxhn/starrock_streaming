@@ -142,16 +142,11 @@ spec:
             - spark.kubernetes.executor.podTemplateFile=/app/k8s/spark-executor-pod-template.yaml
             - --conf
             - spark.kubernetes.memoryOverheadFactor=0.2
-            # Tắt hoàn toàn Broadcast Join — dùng SortMergeJoin thay thế
-            - --conf
-            - spark.sql.autoBroadcastJoinThreshold=-1
             # Tắt Adaptive Broadcast Join trong AQE (vẫn có thể trigger broadcast)
             - --conf
             - spark.sql.adaptive.enabled=true
             - --conf
             - spark.sql.adaptive.localShuffleReader.enabled=true
-            - --conf
-            - spark.sql.adaptive.autoBroadcastJoinThreshold=-1
             # Giảm broadcastTimeout → fail-fast thay vì treo 10 phút
             - --conf
             - spark.sql.broadcastTimeout=120
