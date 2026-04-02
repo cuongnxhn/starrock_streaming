@@ -31,9 +31,9 @@ K8S_NAMESPACE="default"
 K8S_SERVICE_ACCOUNT="spark"
 DOCKER_IMAGE="10.165.13.117:5000/starrock-streaming:latest"
 
-EXECUTOR_MEMORY="6G"
-EXECUTOR_CORES="2"
-DRIVER_MEMORY="2G"
+EXECUTOR_MEMORY="16G"
+EXECUTOR_CORES="4"
+DRIVER_MEMORY="6G"
 EXECUTOR_INSTANCES="2"
 
 # Silver job chạy mỗi 10 phút
@@ -141,7 +141,11 @@ spec:
             - --conf
             - spark.kubernetes.executor.podTemplateFile=/app/k8s/spark-executor-pod-template.yaml
             - --conf
-            - spark.kubernetes.memoryOverheadFactor=0.2
+            - spark.executor.memoryOverhead=4g
+            - --conf
+            - spark.memory.fraction=0.7
+            - --conf
+            - spark.memory.storageFraction=0.2
             # Tắt Adaptive Broadcast Join trong AQE (vẫn có thể trigger broadcast)
             - --conf
             - spark.sql.adaptive.enabled=true
@@ -165,6 +169,19 @@ spec:
             - spark.sql.iceberg.merge-on-read.enabled=false
             - --conf
             - spark.sql.shuffle.partitions=200
+            # Spill configs: cho phép Sort-Merge Join spill xuống disk thay vì OOM
+            # Khi sort buffer đầy, Spark sẽ ghi tạm xuống disk rồi merge lại
+            - --conf
+            - spark.shuffle.spill.compress=true
+            - --conf
+            - spark.shuffle.compress=true
+            # Tăng số kết nối shuffle để giảm thời gian fetch
+            - --conf
+            - spark.shuffle.service.enabled=false
+            - --conf
+            - spark.reducer.maxSizeInFlight=96m
+            - --conf
+            - spark.shuffle.file.buffer=1m
             - /app/silver_main.py
             - --app-name
             - ${APP_NAME}${TOPIC_ARG}

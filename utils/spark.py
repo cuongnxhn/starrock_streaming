@@ -13,11 +13,9 @@ def create_spark_session(app_name, app_config):
     
     conf_builder = SparkSession.builder \
         .appName(app_name) \
-        \
         .config("spark.jars.packages", 
                 "org.apache.hadoop:hadoop-aws:3.3.4,"
                 "com.amazonaws:aws-java-sdk-bundle:1.12.262") \
-        \
         .config("spark.hadoop.io.native.lib.available", "false") \
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
         .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2") \
@@ -27,7 +25,6 @@ def create_spark_session(app_name, app_config):
         .config("spark.eventLog.dir", "s3a://iceberg/spark-events") \
         .config("spark.ui.enabled", "true") \
         .config("spark.ui.showConsoleProgress", "false") \
-        \
         .config("spark.hadoop.fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
         .config("spark.hadoop.fs.s3a.aws.credentials.provider", 
@@ -64,26 +61,16 @@ def create_spark_session(app_name, app_config):
         .config("spark.driver.memory", app_config.get('driver_memory')) \
         .config("spark.driver.cores", app_config.get('driver_cores')) \
         .config("spark.scheduler.mode", app_config.get('scheduler_mode')) \
-        \
-        .config("spark.executor.memoryOverhead", "1g") \
-        .config("spark.driver.memoryOverhead", "1g") \
-        \
-        .config("spark.memory.fraction", "0.6") \
-        .config("spark.memory.storageFraction", "0.3") \
-        \
         .config("spark.sql.shuffle.partitions", "200") \
         .config("spark.default.parallelism", "200") \
-        \
         .config("spark.sql.files.maxPartitionBytes", "134217728") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "false") \
         .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64mb") \
         .config("spark.sql.iceberg.merge.cardinality-check.enabled", "false") \
         .config("spark.sql.iceberg.check-ordering-by-write-mode", "false") \
-        \
         .config("spark.sql.iceberg.split-size", "8388608") \
         .config("spark.sql.iceberg.split-open-file-cost", "0") \
-        \
         .config("spark.kubernetes.executor.deleteOnTermination", "true") \
         .config("spark.kubernetes.submission.waitAppCompletion", "false") \
         .config("spark.kubernetes.executor.podNamePrefix", app_name.lower().replace("_", "-"))
