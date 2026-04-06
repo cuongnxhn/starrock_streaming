@@ -1,11 +1,11 @@
 """
-Entry point cho Silver Batch Job.
-Chạy theo CronJob K8s mỗi 5 phút: rawdata (Bronze) → warehouse (Silver).
-Job exit sau khi xử lý xong (không phải streaming).
+Entry point cho Silver Streaming Job.
+Chạy liên tục (long-running) trên K8s Deployment:
+  rawdata (Bronze) → warehouse (Silver)
+Trigger: ProcessingTime(10 min) — mỗi 10 phút xử lý 1 micro-batch.
 
 Usage:
-    spark-submit silver_main.py --app-name <name> [--topic-name <topic>] \\
-        [--lookback-minutes 15]
+    spark-submit silver_main.py --app-name <name> [--topic-name <topic>]
 """
 
 import argparse
@@ -27,8 +27,8 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"[Silver] Initializing batch job for {args.app_name}...")
-    print(f"[Silver] Lookback window: {args.lookback_minutes} minutes")
+    print(f"[Silver] Initializing streaming job for {args.app_name}...")
+    print(f"[Silver] Mode: ProcessingTime(10 min) — long-running")
 
     # Load config
     config = AppConfig(args.app_name)

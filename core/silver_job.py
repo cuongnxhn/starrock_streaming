@@ -3,9 +3,11 @@ Silver Layer Job: rawdata (Bronze) → staging (Silver) — MERGE/Upsert
 
 Nhiệm vụ:
 - Đọc stream từ Bronze layer (rawdata namespace)
-- Sử dụng Spark Structured Streaming với Trigger.AvailableNow
-- Iceberg sẽ tự động lưu Checkpoint Offset để biết đã đọc tới đâu
-- Áp dụng MERGE INTO logic (insert/update/delete) bằng thư viện foreachBatch vào Silver layer (staging namespace)
+- Sử dụng Spark Structured Streaming với Trigger.ProcessingTime("10 minutes")
+  → Job chạy liên tục (long-running), mỗi 10 phút xử lý 1 micro-batch
+- Iceberg tự động lưu Checkpoint Offset để biết đã đọc tới đâu
+- Áp dụng MERGE INTO logic (insert/update/delete) bằng foreachBatch vào Silver layer
+- Deploy trên K8s dưới dạng Deployment (không phải CronJob)
 
 Kiến trúc: Bronze/Silver (Medallion)
   Kafka → [bronze_job.py] → rawdata (Bronze) → [silver_job.py] → staging (Silver)
@@ -35,10 +37,14 @@ _TARGET_PARTITION_BYTES = int(os.getenv("SILVER_TARGET_PARTITION_MB", "128")) * 
 _MIN_PARTITIONS = int(os.getenv("SILVER_MIN_PARTITIONS", "8"))
 _MAX_PARTITIONS = int(os.getenv("SILVER_MAX_PARTITIONS", "400"))
 
-# Giới hạn số bản ghi tối đa mỗi micro-batch để tránh OOM khi job bị tắt lâu
-# Khi micro-batch vượt ngưỡng này → chỉ xử lý max rows rồi dừng stream sớm.
-# Dữ liệu còn lại sẽ được xử lý ở lần chạy CronJob tiếp theo.
+# Giới hạn số bản ghi tối đa mỗi micro-batch để tránh OOM khi backlog lớn
+# Khi micro-batch vượt ngưỡng này → chia thành sub-batches.
+# Dữ liệu còn lại sẽ được xử lý ở micro-batch tiếp theo (10 phút sau).
 _MAX_ROWS_PER_BATCH = int(os.getenv("SILVER_MAX_ROWS_PER_BATCH", "50000000"))
+
+# Chu kỳ chạy Bronze maintenance (expire_snapshots, rewrite_manifests)
+# Mỗi N micro-batches mới chạy 1 lần → tránh overhead mỗi 10 phút
+_MAINTENANCE_EVERY_N_BATCHES = int(os.getenv("SILVER_MAINTENANCE_EVERY_N_BATCHES", "6"))
 
 
 def _adaptive_repartition(df):
@@ -101,9 +107,11 @@ def _spark_type_to_silver_ddl(data_type):
 class BronzeToSilverETL:
     """
     Job đọc từ Bronze (rawdata) và upsert vào Silver (staging).
-    Được cấu hình Trigger.AvailableNow (nghĩa là xử lý toàn bộ dữ liệu mới nhất rồi exit).
-    Iceberg tự động quản lý vị trí đọc thông qua Checkpoint, xóa bỏ hoàn toàn rủi ro mất dữ liệu
-    do downtime dài ngày.
+    Chạy liên tục (long-running) với Trigger.ProcessingTime("10 minutes"):
+    - Mỗi 10 phút xử lý 1 micro-batch data mới từ Bronze
+    - Nếu không có data mới → micro-batch trống → skip
+    - Job KHÔNG tự exit → deploy trên K8s dưới dạng Deployment
+    - Iceberg tự động quản lý vị trí đọc thông qua Checkpoint
 
     Schema inference:
     - Không lấy schema từ Kafka nữa.
@@ -119,8 +127,11 @@ class BronzeToSilverETL:
         self.app_config = app_config
         self.topic_configs = topic_configs
 
+        # Bộ đếm micro-batch per topic — dùng để schedule maintenance
+        self._batch_counters = {}
+
         if "lookback_minutes" in kwargs:
-            print("  ℹ INFO: lookback_minutes is ignored because job now uses Iceberg Checkpoint + AvailableNow.")
+            print("  ℹ INFO: lookback_minutes is ignored because job now uses Iceberg Checkpoint + ProcessingTime.")
 
         # Thư mục cơ sở lưu checkpoint để quản lý stream offset
         self.checkpoint_base_dir = os.getenv("CHECKPOINT_DIR", "s3a://iceberg/checkpoints") + "/silver"
@@ -968,46 +979,81 @@ class BronzeToSilverETL:
             # → Spark sẽ replay batch này khi restart
             print(f"    ✓ [MicroBatch {batch_id}] DONE — Spark sẽ ghi commits/{batch_id} ngay sau đây")
 
+            # --- Bronze Maintenance (chạy mỗi N micro-batches) ---
+            self._batch_counters[table_name] = self._batch_counters.get(table_name, 0) + 1
+            if self._batch_counters[table_name] >= _MAINTENANCE_EVERY_N_BATCHES:
+                self._batch_counters[table_name] = 0
+                print(f"    ℹ [Maintenance] Running Bronze maintenance for {table_name} (every {_MAINTENANCE_EVERY_N_BATCHES} batches)")
+                try:
+                    self._run_expire_snapshots(bronze_table, table_name, checkpoint_dir)
+                    self._run_rewrite_manifests(bronze_table, table_name)
+                except Exception as maint_err:
+                    print(f"    ⚠ [Maintenance] Error (non-fatal): {maint_err}")
+
         try:
 
-            max_files = int(os.getenv("SILVER_MAX_FILES_PER_TRIGGER", "5"))
-            max_bytes = int(os.getenv("SILVER_MAX_BYTES_PER_TRIGGER", str(256 * 1024 * 1024)))  # 256MB default
+            max_files = int(os.getenv("SILVER_MAX_FILES_PER_TRIGGER", "1"))
+            max_rows = int(os.getenv("SILVER_MAX_ROWS_PER_TRIGGER", "50000"))
 
-            # Log trạng thái checkpoint hiện tại trước khi start
-            # Giúp biết lần này là lần đầu hay đang resume từ checkpoint cũ
-            import os as _os
-
+            # Diagnostic: hiển thị số data files trong Bronze table
+            # Nếu Bronze chỉ có 1-2 files rất lớn thì streaming-max-files-per-micro-batch
+            # không giúp chia nhỏ được → cần rewrite_data_files để split files lớn.
+            try:
+                file_stats = self.spark.sql(
+                    f"SELECT COUNT(*) as file_count, "
+                    f"SUM(record_count) as total_rows, "
+                    f"AVG(record_count) as avg_rows_per_file, "
+                    f"MAX(record_count) as max_rows_per_file "
+                    f"FROM {bronze_table}.files"
+                ).collect()[0]
+                print(
+                    f"    ℹ [Bronze Files] {bronze_table}: "
+                    f"{file_stats['file_count']} data files, "
+                    f"total_rows={int(file_stats['total_rows'] or 0):,}, "
+                    f"avg_rows/file={int(file_stats['avg_rows_per_file'] or 0):,}, "
+                    f"max_rows/file={int(file_stats['max_rows_per_file'] or 0):,}"
+                )
+                if file_stats['file_count'] and file_stats['file_count'] <= max_files:
+                    print(
+                        f"    ⚠ [Bronze Files] WARNING: Bronze chỉ có {file_stats['file_count']} file(s) "
+                        f"≤ max-files-per-micro-batch={max_files} → micro-batch sẽ chứa TẤT CẢ data! "
+                        f"Cần chạy rewrite_data_files để split files lớn thành nhiều files nhỏ."
+                    )
+            except Exception as e:
+                print(f"    ⚠ [Bronze Files] Không đọc được file stats: {e}")
 
             stream_query = (
                 self.spark.readStream
                 .format("iceberg")
                 .option("streaming-skip-delete-snapshots", "true")
                 .option("streaming-skip-overwrite-snapshots", "true")
-                .option("max-files-per-trigger", max_files)
-                .option("max-bytes-per-trigger", max_bytes)
+                .option("streaming-max-files-per-micro-batch", max_files)
+                .option("streaming-max-rows-per-micro-batch", max_rows)
                 .load(bronze_table)
                 .writeStream
                 .foreachBatch(process_micro_batch)
                 .option("checkpointLocation", checkpoint_dir)
-                .trigger(availableNow=True)
+                .queryName(f"silver_{table_name}")
+                .trigger(processingTime="10 minutes")
                 .start()
             )
             print(
-                f"    ℹ Stream started: max-files-per-trigger={max_files}, "
-                f"max-bytes-per-trigger={max_bytes // (1024*1024)}MB, "
+                f"    ℹ Stream started: trigger=ProcessingTime(10 min), "
+                f"streaming-max-files-per-micro-batch={max_files}, "
+                f"streaming-max-rows-per-micro-batch={max_rows:,}, "
                 f"max-rows-per-batch={_MAX_ROWS_PER_BATCH:,} (sub-batch threshold)"
             )
 
-            stream_query.awaitTermination()
+            return stream_query
 
         except Exception as e:
-            print(f"    ✗ [Silver] Error processing stream for {topic_name}: {e}")
+            print(f"    ✗ [Silver] Error starting stream for {topic_name}: {e}")
             raise
 
     def run(self):
         print(f"========================================")
         print(f"[SILVER JOB] Starting: {self.app_name}")
-        print(f"Mode: Streaming Trigger.AvailableNow — Bronze → Silver")
+        print(f"Mode: Streaming ProcessingTime(10 min) — Bronze → Silver (long-running)")
         print(f"========================================")
 
         if not self.topic_configs:
@@ -1045,49 +1091,63 @@ class BronzeToSilverETL:
             # elif data_schema:
             #     topic_schemas[topic_name] = data_schema
 
-        print("\nProcessing topics (Streaming AvailableNow)...")
-        success_count = 0
+        # ── Khởi chạy tất cả topic streams đồng thời ──
+        # ProcessingTime: mỗi stream chạy vĩnh viễn, 10 phút/micro-batch.
+        # Tất cả stream chia sẻ chung Spark session và executor pool.
+        print(f"\nStarting {len(topic_schemas)} topic stream(s) (ProcessingTime: 10 min)...")
+        active_queries = []
         error_count = 0
+        topic_errors = []
 
         for config in self.topic_configs:
             topic_name = config['topic_name']
             if topic_name not in topic_schemas:
                 error_count += 1
+                topic_errors.append(topic_name)
                 continue
             try:
-                log_catalog = os.getenv("ICEBERG_LOG_CATALOG", "iceberg")
-                log_namespace = os.getenv("ICEBERG_LOG_NAMESPACE", "rawdata")
-                bronze_table = f"{log_catalog}.{log_namespace}.{config['table_name']}"
-                checkpoint_dir = f"{self.checkpoint_base_dir}/{config['table_name']}"
-                self.process_topic_stream(config, topic_schemas[topic_name])
-                self._run_expire_snapshots(bronze_table, config['table_name'], checkpoint_dir)
-                self._run_rewrite_manifests(bronze_table, config['table_name'])
-                success_count += 1
+                query = self.process_topic_stream(config, topic_schemas[topic_name])
+                active_queries.append(query)
+                print(f"  ✓ Stream started: {topic_name}")
             except Exception as e:
                 import traceback
-                print(f"  ✗ Failed to process topic {topic_name}: {e}")
+                print(f"  ✗ Failed to start stream for {topic_name}: {e}")
                 print(traceback.format_exc())
                 error_count += 1
-            finally:
-                # Giải phóng toàn bộ Spark cache sau mỗi topic để tránh memory tích lũy
-                # giữa các topic khi chạy tuần tự.
-                self.spark.catalog.clearCache()
-                try:
-                    # Gợi ý JVM GC để thu hồi bộ nhớ trước khi topic tiếp theo bắt đầu
-                    self.spark.sparkContext._jvm.System.gc()
-                except Exception:
-                    pass
-                print(f"  ℹ [Memory] Cache cleared after topic: {topic_name}")
+                topic_errors.append(topic_name)
+
+        if not active_queries:
+            print("\n  ✗ No streams started successfully.")
+            if error_count > 0:
+                raise RuntimeError(
+                    f"Silver job failed to start any stream. "
+                    f"{error_count} topic error(s): {topic_errors}"
+                )
+            return
 
         print(f"\n========================================")
-        print(f"[SILVER JOB] Completed: {self.app_name}")
-        print(f"  ✓ Success: {success_count} topics")
+        print(f"[SILVER JOB] All streams running: {self.app_name}")
+        print(f"  ✓ Active streams: {len(active_queries)}")
         if error_count > 0:
-            print(f"  ✗ Errors:  {error_count} topics")
+            print(f"  ⚠ Failed to start: {error_count} ({topic_errors})")
+        print(f"  ℹ Trigger: ProcessingTime(10 min)")
+        print(f"  ℹ Maintenance: every {_MAINTENANCE_EVERY_N_BATCHES} batches per topic")
+        print(f"  ℹ Job sẽ chạy liên tục — stop bằng kubectl delete deployment")
         print(f"========================================")
 
-        if error_count > 0:
-            raise RuntimeError(
-                f"Silver job completed with {error_count} topic error(s). "
-                "Check logs above for details."
-            )
+        # Block chờ — nếu bất kỳ stream nào die thì raise exception
+        # để K8s Deployment restart pod.
+        try:
+            self.spark.streams.awaitAnyTermination()
+        except Exception as e:
+            print(f"\n  ✗ [SILVER JOB] A stream terminated unexpectedly: {e}")
+            raise
+        finally:
+            # Dừng tất cả remaining streams nếu 1 stream die
+            for q in active_queries:
+                try:
+                    if q.isActive:
+                        q.stop()
+                except Exception:
+                    pass
+            print(f"[SILVER JOB] All streams stopped.")

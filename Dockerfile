@@ -17,7 +17,7 @@ COPY jars/spark-token-provider-kafka-0-10_2.12-3.5.0.jar /opt/spark/jars/
 COPY jars/commons-pool2-2.11.1.jar /opt/spark/jars/
 
 # Copy Iceberg runtime
-COPY jars/iceberg-spark-runtime-3.5_2.12-1.4.0.jar /opt/spark/jars/
+COPY jars/iceberg-spark-runtime-3.5_2.12-1.10.1.jar /opt/spark/jars/
 
 # Copy AWS S3 support JARs (required for s3a:// filesystem)
 COPY jars/hadoop-aws-3.3.4.jar /opt/spark/jars/

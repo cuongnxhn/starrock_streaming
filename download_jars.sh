@@ -36,8 +36,8 @@ wget -q --show-progress -O jars/commons-pool2-2.11.1.jar \
 
 # Iceberg Spark Runtime
 echo "→ Downloading Iceberg Spark Runtime..."
-wget -q --show-progress -O jars/iceberg-spark-runtime-3.5_2.12-1.4.0.jar \
-  https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.0/iceberg-spark-runtime-3.5_2.12-1.4.0.jar
+wget -q --show-progress -O jars/iceberg-spark-runtime-3.5_2.12-1.10.1.jar \
+  https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.10.1/iceberg-spark-runtime-3.5_2.12-1.10.1.jar
 
 # Hadoop AWS (for S3 support)
 echo "→ Downloading Hadoop AWS..."

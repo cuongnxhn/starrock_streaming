@@ -8,7 +8,7 @@ All required JARs have been downloaded to the `jars/` directory:
 ```
 jars/
 ├── commons-pool2-2.11.1.jar                        (0.14 MB)
-├── iceberg-spark-runtime-3.5_2.12-1.4.0.jar       (27.76 MB)
+├── iceberg-spark-runtime-3.5_2.12-1.10.1.jar       (27.76 MB)
 ├── kafka-clients-3.4.1.jar                         (4.82 MB)
 ├── mysql-connector-j-9.6.0.jar                     (2.48 MB)
 ├── postgresql-42.7.8.jar                           (1.06 MB)
@@ -29,7 +29,7 @@ COPY jars/spark-token-provider-kafka-0-10_2.12-3.5.0.jar /opt/spark/jars/
 COPY jars/commons-pool2-2.11.1.jar /opt/spark/jars/
 
 # Copy Iceberg runtime
-COPY jars/iceberg-spark-runtime-3.5_2.12-1.4.0.jar /opt/spark/jars/
+COPY jars/iceberg-spark-runtime-3.5_2.12-1.10.1.jar /opt/spark/jars/
 ```
 
 ### Step 3: Remove --packages Flag ✅
@@ -111,7 +111,7 @@ docker run --rm 10.165.13.117:5000/starrock-streaming:latest ls -lh /opt/spark/j
 **Expected output:**
 ```
 -rw-r--r-- 1 root root  140K ... commons-pool2-2.11.1.jar
--rw-r--r-- 1 root root   28M ... iceberg-spark-runtime-3.5_2.12-1.4.0.jar
+-rw-r--r-- 1 root root   28M ... iceberg-spark-runtime-3.5_2.12-1.10.1.jar
 -rw-r--r-- 1 root root  4.9M ... kafka-clients-3.4.1.jar
 -rw-r--r-- 1 root root  420K ... spark-sql-kafka-0-10_2.12-3.5.0.jar
 -rw-r--r-- 1 root root   48K ... spark-token-provider-kafka-0-10_2.12-3.5.0.jar
@@ -329,7 +329,7 @@ docker push 10.165.13.117:5000/starrock-streaming:v2.1-updated
 
 | Spark Version | Kafka Connector | Iceberg Runtime | Scala Version |
 |---------------|----------------|-----------------|---------------|
-| 3.5.0 ✅ | spark-sql-kafka-0-10_2.12:3.5.0 | iceberg-spark-runtime-3.5_2.12:1.4.0 | 2.12 |
+| 3.5.0 ✅ | spark-sql-kafka-0-10_2.12:3.5.0 | iceberg-spark-runtime-3.5_2.12:1.10.1 | 2.12 |
 | 3.4.0 | spark-sql-kafka-0-10_2.12:3.4.0 | iceberg-spark-runtime-3.4_2.12:1.3.0 | 2.12 |
 | 3.3.0 | spark-sql-kafka-0-10_2.12:3.3.0 | iceberg-spark-runtime-3.3_2.12:1.2.0 | 2.12 |
 

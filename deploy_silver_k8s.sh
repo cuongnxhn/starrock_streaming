@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Deploy script cho Silver Batch Job (rawdata → warehouse, MERGE upsert)
-# Deploy theo app_name — 1 CronJob duy nhất per app, topics được load từ DB
-# Dùng K8s CronJob — chạy mỗi 5 phút rồi exit
+# Deploy script cho Silver Streaming Job (rawdata → warehouse, MERGE upsert)
+# Deploy theo app_name — 1 Deployment duy nhất per app, topics được load từ DB
+# Job chạy liên tục (long-running) với ProcessingTime trigger mỗi 10 phút
 #
 # Usage: ./deploy_silver_k8s.sh <app_name>
 # Example: ./deploy_silver_k8s.sh onebss_bcss
@@ -36,26 +36,23 @@ EXECUTOR_CORES="4"
 DRIVER_MEMORY="6G"
 EXECUTOR_INSTANCES="2"
 
-# Silver job chạy mỗi 10 phút
-CRON_SCHEDULE="*/10 * * * *"
 
-
-# Tên CronJob: silver-<app_name> (gạch dưới → gạch ngang, chữ thường)
-CRONJOB_NAME="silver-${APP_NAME}"
-CRONJOB_NAME="${CRONJOB_NAME,,}"
-CRONJOB_NAME="${CRONJOB_NAME//_/-}"
+# Tên Deployment: silver-<app_name> (gạch dưới → gạch ngang, chữ thường)
+DEPLOY_NAME="silver-${APP_NAME}"
+DEPLOY_NAME="${DEPLOY_NAME,,}"
+DEPLOY_NAME="${DEPLOY_NAME//_/-}"
 
 echo "==========================================="
-echo "🥈 Deploying Silver Batch Job (CronJob)"
-echo "App:      $APP_NAME"
-echo "CronJob:  $CRONJOB_NAME"
+echo "🥈 Deploying Silver Streaming Job (Deployment)"
+echo "App:        $APP_NAME"
+echo "Deployment: $DEPLOY_NAME"
 if [ -n "$SINGLE_TOPIC" ]; then
-    echo "Topic:    $SINGLE_TOPIC (single-topic mode)"
+    echo "Topic:      $SINGLE_TOPIC (single-topic mode)"
 else
-    echo "Topics:   ALL (loaded from topic_configurations)"
+    echo "Topics:     ALL (loaded from topic_configurations)"
 fi
-echo "Schedule: $CRON_SCHEDULE (every 10 min)"
-echo "Mode:     rawdata (Bronze) → warehouse (Silver)"
+echo "Trigger:    ProcessingTime(10 min) — long-running"
+echo "Mode:       rawdata (Bronze) → warehouse (Silver)"
 echo "==========================================="
 echo ""
 
@@ -67,188 +64,191 @@ if [ -n "$SINGLE_TOPIC" ]; then
             - ${SINGLE_TOPIC}"
 fi
 
-cat > "/tmp/${CRONJOB_NAME}.yaml" <<EOF
-apiVersion: batch/v1
-kind: CronJob
+cat > "/tmp/${DEPLOY_NAME}.yaml" <<EOF
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: ${CRONJOB_NAME}
+  name: ${DEPLOY_NAME}
   namespace: ${K8S_NAMESPACE}
   labels:
     app: ${APP_NAME}
     layer: silver
 spec:
-  schedule: "${CRON_SCHEDULE}"
-  # Nếu job trước chưa xong thì bỏ qua lần chạy hiện tại
-  concurrencyPolicy: Forbid
-  # Giữ 3 job thành công / 1 job thất bại để debug
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 1
-  jobTemplate:
+  # Chỉ 1 replica — tránh 2 instance cùng ghi Silver table
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+      layer: silver
+  # Recreate strategy: dừng pod cũ hoàn toàn trước khi tạo pod mới
+  # (tránh 2 Spark driver cùng lúc tranh chấp executor + checkpoint)
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+        layer: silver
+        spark-role: driver
     spec:
-      activeDeadlineSeconds: 3600
-      template:
-        metadata:
-          labels:
-            app: ${APP_NAME}
-            layer: silver
-            spark-role: driver
-        spec:
-          serviceAccountName: ${K8S_SERVICE_ACCOUNT}
-          # Job chạy xong thì không restart
-          restartPolicy: Never
-          containers:
-          - name: spark-driver
-            image: ${DOCKER_IMAGE}
-            imagePullPolicy: Always
-            command:
-            - /opt/spark/bin/spark-submit
-            - --master
-            - k8s://https://kubernetes.default.svc.cluster.local:443
-            - --deploy-mode
-            - client
-            - --name
-            - ${CRONJOB_NAME}
-            - --conf
-            - spark.kubernetes.namespace=${K8S_NAMESPACE}
-            - --conf
-            - spark.kubernetes.authenticate.driver.serviceAccountName=${K8S_SERVICE_ACCOUNT}
-            - --conf
-            - spark.kubernetes.container.image=${DOCKER_IMAGE}
-            - --conf
-            - spark.executor.instances=${EXECUTOR_INSTANCES}
-            - --conf
-            - spark.executor.memory=${EXECUTOR_MEMORY}
-            - --conf
-            - spark.executor.cores=${EXECUTOR_CORES}
-            - --conf
-            - spark.driver.memory=${DRIVER_MEMORY}
-            - --conf
-            - spark.driver.host=\$(POD_IP)
-            - --conf
-            - spark.driver.port=7078
-            - --conf
-            - spark.driver.blockManager.port=7079
-            - --conf
-            - spark.kubernetes.driver.pod.name=\$(POD_NAME)
-            - --conf
-            - spark.kubernetes.executor.podNamePrefix=${CRONJOB_NAME}
-            - --conf
-            - spark.kubernetes.executor.deleteOnTermination=true
-            - --conf
-            - spark.kubernetes.executor.secrets.app-env-secret=/mnt/secrets
-            - --conf
-            - spark.kubernetes.driver.podTemplateFile=/app/k8s/spark-driver-pod-template.yaml
-            - --conf
-            - spark.kubernetes.executor.podTemplateFile=/app/k8s/spark-executor-pod-template.yaml
-            - --conf
-            - spark.executor.memoryOverhead=4g
-            - --conf
-            - spark.memory.fraction=0.7
-            - --conf
-            - spark.memory.storageFraction=0.2
-            # Tắt Adaptive Broadcast Join trong AQE (vẫn có thể trigger broadcast)
-            - --conf
-            - spark.sql.adaptive.enabled=true
-            - --conf
-            - spark.sql.adaptive.localShuffleReader.enabled=true
-            # Giảm broadcastTimeout → fail-fast thay vì treo 10 phút
-            - --conf
-            - spark.sql.broadcastTimeout=120
-            # Network timeout đủ lớn cho MERGE bảng lớn
-            - --conf
-            - spark.network.timeout=600s
-            - --conf
-            - spark.executor.heartbeatInterval=60s
-            # TẮT speculation — gây task storm trên bảng lớn, làm executor bị OOM
-            - --conf
-            - spark.speculation=false
-            - --conf
-            - spark.task.maxFailures=4
-            # Iceberg MERGE: đọc file theo sequence thay vì parallel quá mức
-            - --conf
-            - spark.sql.iceberg.merge-on-read.enabled=false
-            - --conf
-            - spark.sql.shuffle.partitions=200
-            # Spill configs: cho phép Sort-Merge Join spill xuống disk thay vì OOM
-            # Khi sort buffer đầy, Spark sẽ ghi tạm xuống disk rồi merge lại
-            - --conf
-            - spark.shuffle.spill.compress=true
-            - --conf
-            - spark.shuffle.compress=true
-            # Tăng số kết nối shuffle để giảm thời gian fetch
-            - --conf
-            - spark.shuffle.service.enabled=false
-            - --conf
-            - spark.reducer.maxSizeInFlight=96m
-            - --conf
-            - spark.shuffle.file.buffer=1m
-            - /app/silver_main.py
-            - --app-name
-            - ${APP_NAME}${TOPIC_ARG}
-            resources:
-              requests:
-                memory: 2Gi
-                cpu: "1000m"
-              limits:
-                memory: 2Gi
-                cpu: "2000m"
-            ports:
-            - containerPort: 7078
-              name: driver-rpc
-            - containerPort: 7079
-              name: blockmanager
-            - containerPort: 4040
-              name: spark-ui
-            env:
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: KAFKA_CLIENT_PROPERTIES
-              value: /etc/kafka/secrets/client.properties
-            envFrom:
-            - secretRef:
-                name: app-env-secret
-            volumeMounts:
-            - name: kafka-client-config
-              mountPath: /etc/kafka/secrets
-              readOnly: true
-            - name: kafka-ssl-certs
-              mountPath: /etc/kafka/ssl
-              readOnly: true
-          volumes:
-          - name: kafka-client-config
-            secret:
-              secretName: kafka-client-config
-              defaultMode: 0444
-          - name: kafka-ssl-certs
-            secret:
-              secretName: kafka-ssl-certs
-              defaultMode: 0444
+      serviceAccountName: ${K8S_SERVICE_ACCOUNT}
+      # Pod crash → K8s tự restart (Deployment default = Always)
+      restartPolicy: Always
+      # Cho Spark 5 phút để graceful shutdown (dừng stream, commit checkpoint)
+      terminationGracePeriodSeconds: 300
+      containers:
+      - name: spark-driver
+        image: ${DOCKER_IMAGE}
+        imagePullPolicy: Always
+        command:
+        - /opt/spark/bin/spark-submit
+        - --master
+        - k8s://https://kubernetes.default.svc.cluster.local:443
+        - --deploy-mode
+        - client
+        - --name
+        - ${DEPLOY_NAME}
+        - --conf
+        - spark.kubernetes.namespace=${K8S_NAMESPACE}
+        - --conf
+        - spark.kubernetes.authenticate.driver.serviceAccountName=${K8S_SERVICE_ACCOUNT}
+        - --conf
+        - spark.kubernetes.container.image=${DOCKER_IMAGE}
+        - --conf
+        - spark.executor.instances=${EXECUTOR_INSTANCES}
+        - --conf
+        - spark.executor.memory=${EXECUTOR_MEMORY}
+        - --conf
+        - spark.executor.cores=${EXECUTOR_CORES}
+        - --conf
+        - spark.driver.memory=${DRIVER_MEMORY}
+        - --conf
+        - spark.driver.host=\$(POD_IP)
+        - --conf
+        - spark.driver.port=7078
+        - --conf
+        - spark.driver.blockManager.port=7079
+        - --conf
+        - spark.kubernetes.driver.pod.name=\$(POD_NAME)
+        - --conf
+        - spark.kubernetes.executor.podNamePrefix=${DEPLOY_NAME}
+        - --conf
+        - spark.kubernetes.executor.deleteOnTermination=true
+        - --conf
+        - spark.kubernetes.executor.secrets.app-env-secret=/mnt/secrets
+        - --conf
+        - spark.kubernetes.driver.podTemplateFile=/app/k8s/spark-driver-pod-template.yaml
+        - --conf
+        - spark.kubernetes.executor.podTemplateFile=/app/k8s/spark-executor-pod-template.yaml
+        - --conf
+        - spark.executor.memoryOverhead=4g
+        - --conf
+        - spark.memory.fraction=0.7
+        - --conf
+        - spark.memory.storageFraction=0.2
+        # Tắt Adaptive Broadcast Join trong AQE (vẫn có thể trigger broadcast)
+        - --conf
+        - spark.sql.adaptive.enabled=true
+        - --conf
+        - spark.sql.adaptive.localShuffleReader.enabled=true
+        # Giảm broadcastTimeout → fail-fast thay vì treo 10 phút
+        - --conf
+        - spark.sql.broadcastTimeout=120
+        # Network timeout đủ lớn cho MERGE bảng lớn
+        - --conf
+        - spark.network.timeout=600s
+        - --conf
+        - spark.executor.heartbeatInterval=60s
+        # TẮT speculation — gây task storm trên bảng lớn, làm executor bị OOM
+        - --conf
+        - spark.speculation=false
+        - --conf
+        - spark.task.maxFailures=4
+        # Iceberg MERGE: đọc file theo sequence thay vì parallel quá mức
+        - --conf
+        - spark.sql.iceberg.merge-on-read.enabled=false
+        - --conf
+        - spark.sql.shuffle.partitions=200
+        # Spill configs: cho phép Sort-Merge Join spill xuống disk thay vì OOM
+        # Khi sort buffer đầy, Spark sẽ ghi tạm xuống disk rồi merge lại
+        - --conf
+        - spark.shuffle.spill.compress=true
+        - --conf
+        - spark.shuffle.compress=true
+        # Tăng số kết nối shuffle để giảm thời gian fetch
+        - --conf
+        - spark.shuffle.service.enabled=false
+        - --conf
+        - spark.reducer.maxSizeInFlight=96m
+        - --conf
+        - spark.shuffle.file.buffer=1m
+        - /app/silver_main.py
+        - --app-name
+        - ${APP_NAME}${TOPIC_ARG}
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1000m"
+          limits:
+            memory: 2Gi
+            cpu: "2000m"
+        ports:
+        - containerPort: 7078
+          name: driver-rpc
+        - containerPort: 7079
+          name: blockmanager
+        - containerPort: 4040
+          name: spark-ui
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KAFKA_CLIENT_PROPERTIES
+          value: /etc/kafka/secrets/client.properties
+        envFrom:
+        - secretRef:
+            name: app-env-secret
+        volumeMounts:
+        - name: kafka-client-config
+          mountPath: /etc/kafka/secrets
+          readOnly: true
+        - name: kafka-ssl-certs
+          mountPath: /etc/kafka/ssl
+          readOnly: true
+      volumes:
+      - name: kafka-client-config
+        secret:
+          secretName: kafka-client-config
+          defaultMode: 0444
+      - name: kafka-ssl-certs
+        secret:
+          secretName: kafka-ssl-certs
+          defaultMode: 0444
 EOF
 
-kubectl apply -f "/tmp/${CRONJOB_NAME}.yaml"
-echo "✓ Deployed CronJob: ${CRONJOB_NAME}"
-rm -f "/tmp/${CRONJOB_NAME}.yaml"
+kubectl apply -f "/tmp/${DEPLOY_NAME}.yaml"
+echo "✓ Deployed Deployment: ${DEPLOY_NAME}"
+rm -f "/tmp/${DEPLOY_NAME}.yaml"
 
 echo ""
 echo "=========================================="
-echo "✅ Silver CronJob created!"
+echo "✅ Silver Deployment created!"
 echo "=========================================="
 echo ""
 echo "📋 Useful commands:"
 echo ""
-echo "View CronJob:  kubectl get cronjob ${CRONJOB_NAME} -n ${K8S_NAMESPACE}"
-echo "View Jobs:     kubectl get jobs -l app=${APP_NAME},layer=silver -n ${K8S_NAMESPACE}"
-echo "View pods:     kubectl get pods -l app=${APP_NAME},layer=silver -n ${K8S_NAMESPACE}"
-echo "View logs:     kubectl logs -l app=${APP_NAME},layer=silver -n ${K8S_NAMESPACE} --tail=200"
+echo "View Deployment:  kubectl get deployment ${DEPLOY_NAME} -n ${K8S_NAMESPACE}"
+echo "View pods:        kubectl get pods -l app=${APP_NAME},layer=silver -n ${K8S_NAMESPACE}"
+echo "View logs:        kubectl logs -l app=${APP_NAME},layer=silver -n ${K8S_NAMESPACE} --tail=200 -f"
+echo "Restart:          kubectl rollout restart deployment ${DEPLOY_NAME} -n ${K8S_NAMESPACE}"
 echo ""
-echo "Trigger manually:"
-echo "  kubectl create job silver-manual-\$(date +%s) --from=cronjob/${CRONJOB_NAME} -n ${K8S_NAMESPACE}"
+echo "Scale down (pause):  kubectl scale deployment ${DEPLOY_NAME} --replicas=0 -n ${K8S_NAMESPACE}"
+echo "Scale up  (resume):  kubectl scale deployment ${DEPLOY_NAME} --replicas=1 -n ${K8S_NAMESPACE}"
 echo ""
-echo "Delete:        kubectl delete cronjob ${CRONJOB_NAME} -n ${K8S_NAMESPACE}"
+echo "Delete:           kubectl delete deployment ${DEPLOY_NAME} -n ${K8S_NAMESPACE}"
 echo ""

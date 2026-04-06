@@ -31,7 +31,7 @@ You should see:
 - ✅ kafka-clients-3.4.1.jar
 - ✅ spark-token-provider-kafka-0-10_2.12-3.5.0.jar
 - ✅ commons-pool2-2.11.1.jar
-- ✅ iceberg-spark-runtime-3.5_2.12-1.4.0.jar
+- ✅ iceberg-spark-runtime-3.5_2.12-1.10.1.jar
 
 ---
 
