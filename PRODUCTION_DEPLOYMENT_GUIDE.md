@@ -353,21 +353,24 @@ You're now using the **production-ready approach** for Spark on Kubernetes with 
 ### Next Step:
 **Build and push your Docker image, then deploy!** 🚀
 
-```bash
-# example : 
-# ./deploy_k8s_per_topic_kubectl.sh low_traffic_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO
+# Xem spark history UI
+kubectl port-forward --address 0.0.0.0 svc/spark-history-server-svc 4044:18080 -n spark-history
+
+# Setup secrets
+./setup_k8s_secret.sh
+./setup_kafka_secrets.sh
+
 # Remove image
 docker rmi 10.165.13.117:5000/starrock-streaming:latest
+
 # Build
 docker build -t 10.165.13.117:5000/starrock-streaming:latest .
 
 # Push
 docker push 10.165.13.117:5000/starrock-streaming:latest
 
-kubectl apply -f spark-rbac.yaml
-
-sed -i -e 's/\r$//' deploy_bronze_k8s.sh
 # Deploy
+sed -i -e 's/\r$//' deploy_silver_k8s.sh
 ./deploy_k8s_per_topic.sh my_app my_topic
 example : ./deploy_k8s_per_topic_kubectl.sh low_traffic_app CDC_LOG_ONEBSS_CSS_HD_BANCHEO
 

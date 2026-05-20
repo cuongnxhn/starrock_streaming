@@ -124,7 +124,7 @@ spec:
         - --conf
         - spark.kubernetes.executor.deleteOnTermination=true
         - --conf
-        - spark.kubernetes.executor.deleteOrphanPods=true
+        - spark.kubernetes.driver.pod.name=\$(POD_NAME)
         - --conf
         - spark.kubernetes.executor.secrets.app-env-secret=/mnt/secrets
         - --conf

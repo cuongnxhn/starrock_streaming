@@ -249,7 +249,8 @@ class SchemaChangeDetector:
         dropped_cols = []
         type_changed_cols = []
         
-        for name, field in actual_new_schema.fields:
+        for field in actual_new_schema.fields:
+            name = field.name
             if name.lower() not in current_fields:
                 added_cols.append(field)
             else:
@@ -265,10 +266,13 @@ class SchemaChangeDetector:
                          # Iceberg supports widening decimal, but for simplicity we flag it
                     type_changed_cols.append((curr_field, field))
                     
-        for name, field in current_silver_schema.fields:
+        for field in current_silver_schema.fields:
+            name = field.name
             if name.lower() not in actual_fields:
                 dropped_cols.append(field)
-                
+        print(f"Added columns: {[f.name for f in added_cols]}")
+        print(f"Dropped columns: {[f.name for f in dropped_cols]}")
+        print(f"Type changed columns: {[f.name for f in type_changed_cols]}")
         return SchemaChangeReport(added_cols, dropped_cols, type_changed_cols)
 
 class SchemaEvolutionManager:

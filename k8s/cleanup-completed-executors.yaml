@@ -1,0 +1,74 @@
+---
+# CronJob dọn dẹp các executor pods đã Completed/Failed
+# Chạy mỗi 15 phút, xóa các pods có status Succeeded hoặc Failed
+# mà có label spark-role=executor
+#
+# Deploy: kubectl apply -f k8s/cleanup-completed-executors.yaml
+# Check:  kubectl get cronjob cleanup-spark-executors -n default
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup-spark-executors
+  namespace: default
+  labels:
+    app: spark-cleanup
+spec:
+  # Chạy mỗi 15 phút
+  schedule: "*/15 * * * *"
+  # Không chạy đồng thời nhiều cleanup jobs
+  concurrencyPolicy: Forbid
+  # Giữ lại 3 job thành công và 1 job thất bại gần nhất
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      # Tự xóa Job sau 5 phút
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          serviceAccountName: spark
+          restartPolicy: Never
+          containers:
+          - name: cleanup
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== Cleaning up completed Spark executor pods ==="
+              echo "Time: $(date)"
+              echo ""
+
+              # Xóa executor pods đã Succeeded (Completed)
+              COMPLETED=$(kubectl get pods -n default \
+                --field-selector=status.phase=Succeeded \
+                -l spark-role=executor \
+                -o name 2>/dev/null | wc -l)
+              echo "Found ${COMPLETED} completed executor pods"
+
+              if [ "$COMPLETED" -gt 0 ]; then
+                kubectl delete pods -n default \
+                  --field-selector=status.phase=Succeeded \
+                  -l spark-role=executor \
+                  --grace-period=0
+                echo "✓ Deleted completed executor pods"
+              fi
+
+              # Xóa executor pods đã Failed
+              FAILED=$(kubectl get pods -n default \
+                --field-selector=status.phase=Failed \
+                -l spark-role=executor \
+                -o name 2>/dev/null | wc -l)
+              echo "Found ${FAILED} failed executor pods"
+
+              if [ "$FAILED" -gt 0 ]; then
+                kubectl delete pods -n default \
+                  --field-selector=status.phase=Failed \
+                  -l spark-role=executor \
+                  --grace-period=0
+                echo "✓ Deleted failed executor pods"
+              fi
+
+              echo ""
+              echo "=== Cleanup complete ==="
