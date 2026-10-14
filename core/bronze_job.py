@@ -71,6 +71,9 @@ class KafkaToBronzeETL:
         try:
             self.spark.sql(f"DESCRIBE TABLE {full_table_name}")
             print(f"  ✓ Bronze table exists: {table_name}")
+            # Đảm bảo table đã có đủ retention properties
+            # (cho các table được tạo trước khi có config này)
+            self._ensure_retention_properties(full_table_name)
             return
         except Exception:
             pass
@@ -89,11 +92,32 @@ class KafkaToBronzeETL:
         PARTITIONED BY (data_date_key)
         TBLPROPERTIES (
             'write.format.default' = 'parquet',
-            'write.parquet.compression-codec' = 'snappy'
+            'write.parquet.compression-codec' = 'snappy',
+
+            -- Snapshot retention: đồng bộ với silver_job expire settings
+            'history.expire.max-snapshot-age-ms' = '604800000',
+            'history.expire.min-snapshots-to-keep' = '200',
+
+            'write.metadata.delete-after-commit.enabled' = 'true',
+            'write.metadata.previous-versions-max' = '10'
         )
         """
         self.spark.sql(create_sql)
         print(f"  ✓ Created Bronze table: {table_name}")
+
+    def _ensure_retention_properties(self, full_table_name):
+        """Đảm bảo table đã có retention + metadata cleanup properties (cho các table tạo trước khi có config)."""
+        try:
+            self.spark.sql(f"""
+                ALTER TABLE {full_table_name} SET TBLPROPERTIES (
+                    'history.expire.max-snapshot-age-ms' = '604800000',
+                    'history.expire.min-snapshots-to-keep' = '200',
+                    'write.metadata.delete-after-commit.enabled' = 'true',
+                    'write.metadata.previous-versions-max' = '10'
+                )
+            """)
+        except Exception as e:
+            print(f"  ⚠ Could not update retention properties for {full_table_name}: {e}")
 
     def process_topic_stream(self, topic_config, pool_name):
         """
